@@ -1,9 +1,9 @@
 For self-introduction in Japanese: https://github.com/ShikiSuen/ShikiSuen/blob/master/README.md
 
-Shiki Suen; Score Engraver (Dorico only); Studying Film Music in Japan; Trilingual (🇨🇳🇯🇵🇬🇧); macOS User.<br />
+Shiki Suen; Score Engraver (Dorico only); Studying Film Music in Japan; Trilingual (🇨🇳🇯🇵🇬🇧); macOS User; Amateur programmer (C# & Swift).<br />
 - 🎓 A Bachelor of Music graduated from [Digital Audio Arts, University of Lethbridge](https://www.uleth.ca/fine-arts/programs-and-courses/programs/bmus-digital-audio-arts).
 - 🏫 Was and is studying orchestration with Arlan Schultz. Have studied classical harmoniology with Mark Richards and Satoshi Iwata.
-- ⏰ Came back to China in April 2021.
+- ⏰ Came back to China in April 2021. My main job now is programming, but I am still writing music.
 
 🎼 **Demo works at SoundCloud**：https://soundcloud.com/shikisuen/sets/spotlighted-portfolios
 
