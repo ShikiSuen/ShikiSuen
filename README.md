@@ -1,6 +1,6 @@
-**孫 志貴**｜山東出身｜Dorico だけで楽譜浄書＆劇伴作曲｜日英中三つ言語話せる｜Mac使い。 <br />
+**孫 志貴**｜山東出身｜Dorico だけで楽譜浄書＆劇伴作曲｜日英中三つ言語話せる｜Mac使い | プログラマー（C#・Swift）。 <br />
 - 🎓 [**レスブリッジ大学音楽学部**出身で、**デジタル音響芸術専攻卒業（学士号）**](https://www.uleth.ca/fine-arts/programs-and-courses/programs/bmus-digital-audio-arts)。
-- 🏫 帰国済み。
+- 🏫 2023年4月にて帰国。今のメイン職業はプログラマーですが、作曲活動も行っております。
 - [My self-introduction in English](https://github.com/ShikiSuen/ShikiSuen/blob/master/README_EN.md)
 >平成２年（中国）山東生まれ。平成30年（カナダの）[レスブリッジ大学でデジタル音響芸術専攻](https://www.uleth.ca/fine-arts/programs-and-courses/programs/bmus-digital-audio-arts)修了し音楽学士号を獲得。作曲を [Arlan N. Schultz](https://www.uleth.ca/fine-arts/study/faculty-and-staff/arlan-schultz) 先生の下に師事、古典和声理論は Mark Richards 先生と 岩田学 先生 両氏の下に師事、そして DTM 製作の勉強については隼田義博先生のもとに暫くお世話を受けたこともございます。主には Steinberg Dorico で譜面作曲。
 
