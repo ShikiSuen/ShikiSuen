@@ -13,6 +13,4 @@ To listen some of my demo works with full score:《[Verses Warming](https://vime
 
 - 🎼 I developed a font called "Yuzuri" which is used for showing Roman Numeral symbols designed for Geidai Harmonielehre (Shimaoka's theories of harmony).
 - 🎼 I prefer using Steinberg Dorico Pro + Arne Wallander NotePerformer to do both my music engrave work and orchestral compositions. This combination is much efficient than using Sibelius / Finale.
-- 💻 I can develop iOS / macOS apps using Swift.
-
-![Top Langs](https://github-readme-stats.vercel.app/api/top-langs/?username=shikisuen&layout=compact)
+- 💻 I can develop iOS / macOS apps using Swift. E.g.: [***vChewing Input Method***](https://vchewing.github.io/)。
