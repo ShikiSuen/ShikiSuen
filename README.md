@@ -1,7 +1,7 @@
 **孫 志貴**｜山東出身｜用 Dorico 製作交響樂譜、配樂｜使用語言：「漢語」「英語」「日語」｜Mac 使用者 | 程式師（C#・Swift）。 <br />
 - 🎓 [**University of Lethbridge 大学音樂学部**出身、**數位音響藝術專攻畢業（學士學位）**](https://www.uleth.ca/fine-arts/programs-and-courses/programs/bmus-digital-audio-arts)。
 - 🏫 2023年4月歸鄉。目前的職業是自由職業者（配樂＆程式師）。
-- [My self-introduction in English](https://github.com/ShikiSuen/ShikiSuen/blob/master/README_EN.md)[日本語での自己紹介](https://github.com/ShikiSuen/ShikiSuen/blob/master/README_JP.md)
+- [My self-introduction in English](https://github.com/ShikiSuen/ShikiSuen/blob/master/README_EN.md) | [日本語での自己紹介](https://github.com/ShikiSuen/ShikiSuen/blob/master/README_JP.md)
 >平成2年生於山東。平成30年[University of Lethbridge 大学數位音響藝術專攻畢業](https://www.uleth.ca/fine-arts/programs-and-courses/programs/bmus-digital-audio-arts)且獲得音樂學士學位。作曲師從於 [Arlan N. Schultz](https://www.uleth.ca/fine-arts/study/faculty-and-staff/arlan-schultz) 、古典和声理論曾分別師從 Mark Richards 先生與 岩田学 先生 、也曾就數位音樂製作短暫師從隼田義博先生。主要使用 Steinberg Dorico 作曲編曲。
 
 🎼 **部分音樂作品請洽 SoundCloud へ**：https://soundcloud.com/shikisuen/sets/spotlighted-portfolios <br />
