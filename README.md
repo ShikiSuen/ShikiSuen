@@ -11,4 +11,6 @@
 
 - 🎼 パソコンで誰も軽く島岡系芸大和声記号を入力できるフォント「ゆずり」を開発しました。SIF開放式フォント授権で無料配布中。https://github.com/ShikiSuen/Yuzuri-Font
 - 🎼 楽譜浄書について、使えるのは Sibelius と Dorico だけで、**今は Dorico だけ使っています**。Dorico は Finale の何倍より効率的な譜面浄書ソフトで、素早く出版レベルの総譜とパート譜を作れます♪ 。交響曲録音で自分の作った総譜（すこあ）と分譜（ぱあとふ）をそのまま使った実績もあります。
-- 💻 DTM用パソコンのシステムを保守することは上手く出来ます（mac か Windows か問わず）。<br />Linux / FreeBSD に基づく VPS サーバーで HTML ウェブサイトを築ることができます。<br />PHP+MySQL 環境での一部ウェブサイトソフト（XenForo / PHPBB など）のインストール＆配置も出来ます。
+- 💻 Swift言語でiOSとmacOSのソフト開発はできます。
+
+![Top Langs](https://github-readme-stats.vercel.app/api/top-langs/?username=shikisuen&layout=compact)
