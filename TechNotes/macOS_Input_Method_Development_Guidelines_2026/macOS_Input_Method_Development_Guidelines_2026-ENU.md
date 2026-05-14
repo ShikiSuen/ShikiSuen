@@ -155,6 +155,8 @@ Key points of the example:
 
 This is only a minimal template—you can wrap the caching logic inside your own factory or manager in a real project. The essential concept is that all state lives in sharable session objects keyed by client; the IMKInputController itself is just a thin, non‑holding facade.
 
+> Note that the NSMapTable workaround works well on macOS 26.5. However, on earlier macOS releases, this workaround might let Chrome randomly hang for less than 20 seconds. My deduction is that something like autoreleasepool might get called by the time NSMapTable releases a weak key, blocking both the IME and the client app. To cope with this situation, a pure-swift LRU table (with capacity set at 5) might be more appropriate than NSMapTable for this purpose. The key can be the integer RAM address. I personally suspect that macOS 26.5 already did some related optimization against the InputMethodKit.
+
 Here's a practical example: **IMKInputController doesn't hold any objects** but can establish weak-reference relationships with business module objects. For instance, an input method's business logic is a pure Swift `InputSession` object. Make it the delegate, but don't let IMKInputController hold it:
 
 ```swift

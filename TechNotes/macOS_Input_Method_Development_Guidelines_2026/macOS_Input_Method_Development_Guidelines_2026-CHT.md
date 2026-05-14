@@ -151,6 +151,8 @@ nonisolated public final class MyIMKInputController: IMKInputController, @unchec
 
 這僅是一個簡化的樣板，實際專案裡你可以把這些概念封裝成你自己的工廠/管理器。核心觀念是讓 `IMKInputController` 本身保持「乾淨」——沒有長期住著的強參照，所有狀態都擺在可以全局共用、以 client 為鍵的 session 物件裡。
 
+> 額外注意：本文提到的 NSMapTable 方法在 macOS 26.5 系統下沒有什麼問題，但是在稍早版本為止的 macOS 系統下系統下可能會出現 Chrome 偶爾會 hang 十幾秒的情況。目前的推論是 NSMapTable 在釋放 weak key 的時候會呼叫 autoreleasepool 這樣的強制釋放操作、且該操作會同時對輸入法與 client app 構成臨時阻塞。因應此種情形，或許使用純 Swift 的 LRU Table (容量設為 5) 更合適（以記憶體位址 Integer 為 Key）。筆者懷疑 macOS 26.5 對 InputMethodKit 可能做了與此有關的改進。
+
 筆者這裡舉個例子：輸入法業務模組是一個純 Swift 的 Class `InputSession` 會話模組。當作 IMKInputController 的 Delegate Class，但 IMKInputController 不持有它。見下文：
 
 ```swift
