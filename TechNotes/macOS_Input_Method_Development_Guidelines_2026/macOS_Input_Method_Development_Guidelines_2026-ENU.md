@@ -142,20 +142,18 @@ This leaves developers with two tasks: one we covered earlier ("async-run approp
 
 Why is the client identical across different input method switches? Because this client is an NSConnection Distributed Object uniformly dispatched by IMK, possessing memory address consistency. This is the crucial detail that makes the weak-key solution viable.
 
-The solution is simple: use an `NSMapTable` (or any equivalent weak‑key hash) where the *key* is a weak reference to the client object. When the client deallocates, the table automatically ejects the entry on next access, so you never end up holding stale strong pointers.
+The most intuitive approach is to use an `NSMapTable` (or any equivalent weak‑key hash) where the *key* is a weak reference to the client object. When the client deallocates, the table automatically ejects the entry on next access. **However, `NSMapTable` synchronously triggers autoreleasepool draining on the main thread when releasing a weak key, which can simultaneously block both the IME and the client app on macOS versions prior to 26.5—observed as random ≤20‑second hangs in Chrome. Therefore, a pure‑Swift LRU table (capacity 5, keyed by the client object's integer RAM address) is the recommended approach, completely sidestepping the autoreleasepool entanglement.**
 
-The practical upshot is: **IMKInputController holds no objects itself**. Instead you maintain a separate business‑logic class and access it via weak references or provider lambda expressions. In the sample below `InputSession` represents such a session object. The controller merely looks up (or creates) the session in a global cache keyed by the distributed client, then forwards events. This keeps the controller “clean”: it never retains the session, nor the client, avoiding ARC churn when input methods are switched rapidly.
+The practical upshot is: **IMKInputController holds no objects itself**. Instead you maintain a separate business‑logic class and access it via weak references or provider lambda expressions. In the sample below `InputSession` represents such a session object. The controller merely looks up (or creates) the session in a global LRU cache keyed by the client's address, then forwards events. This keeps the controller “clean”: it never retains the session, nor the client, avoiding ARC churn when input methods are switched rapidly.
 
 Key points of the example:
 
 - `MyIMKInputController.core` is a `weak` property; the session can outlive the controller and the reference will nil‑out automatically.
 - `getClientProvider()` returns a lambda expression that safely invokes `client()` without trapping a strong reference to the controller.
 - `callCoreAtLeastOnce(client:)` is executed on the MainActor; it first tries to reuse an existing `InputSession` from the cache (mitigating ARC pressure during CapsLock spam), reassigning it to the new controller if found. Otherwise it constructs a fresh session.
-- **The constructor can use the provided `inputClient` parameter directly.** On macOS 10.9 ~ 10.12, `client()` still returns `nil` even after `super.init(server:delegate:client:)` returns—this is due to the nature of Distributed Objects. IMK uses NSConnection for cross-process communication, and `client()` returns a Distributed Object proxy (the `NSDistantObject` Mach port proxy on macOS 10.9). Proxy object initialization is not synchronous: IMK has not yet completed the proxy negotiation and establishment with the remote client object during synchronous constructor execution. However, the constructor’s `inputClient` parameter *is* the client object—using `wrap`/`unwrap` to safely pass it into the `mainSync` lambda expression, `callCoreAtLeastOnce(client:)` can run synchronously, ensuring `core` is guaranteed non-nil when the constructor returns. When a cache miss requires a new `InputSession`, the session is first created with a static lambda expression capturing the passed-in client, then a `DispatchQueue.main.async` block immediately replaces it with the proper dynamic `getClientProvider()`, so the `NSMapTable` weak-key mechanism is not undermined by the brief strong capture.
+- **The constructor can use the provided `inputClient` parameter directly.** On macOS 10.9 ~ 10.12, `client()` still returns `nil` even after `super.init(server:delegate:client:)` returns—this is due to the nature of Distributed Objects. IMK uses NSConnection for cross-process communication, and `client()` returns a Distributed Object proxy (the `NSDistantObject` Mach port proxy on macOS 10.9). Proxy object initialization is not synchronous: IMK has not yet completed the proxy negotiation and establishment with the remote client object during synchronous constructor execution. However, the constructor’s `inputClient` parameter *is* the client object—using `wrap`/`unwrap` to safely pass it into the `mainSync` lambda expression, `callCoreAtLeastOnce(client:)` can run synchronously, ensuring `core` is guaranteed non-nil when the constructor returns. When a cache miss requires a new `InputSession`, the session is first created with a static lambda expression capturing the passed-in client, then a `DispatchQueue.main.async` block immediately replaces it with the proper dynamic `getClientProvider()`, so the brief strong capture does not interfere with the LRU cache's key stability.
 
-This is only a minimal template—you can wrap the caching logic inside your own factory or manager in a real project. The essential concept is that all state lives in sharable session objects keyed by client; the IMKInputController itself is just a thin, non‑holding facade.
-
-> Note that the NSMapTable workaround works well on macOS 26.5. However, on earlier macOS releases, this workaround might let Chrome randomly hang for less than 20 seconds. My deduction is that something like autoreleasepool might get called by the time NSMapTable releases a weak key, blocking both the IME and the client app. To cope with this situation, a pure-swift LRU table (with capacity set at 5) might be more appropriate than NSMapTable for this purpose. The key can be the integer RAM address. I personally suspect that macOS 26.5 already did some related optimization against the InputMethodKit.
+This is only a minimal template—you can wrap the caching logic inside your own factory or manager in a real project. The essential concept is that all state lives in sharable session objects keyed by client; the IMKInputController itself is just a thin, non‑holding facade. The LRU approach guarantees bounded memory (fixed capacity 5) and never blocks the runloop; if targeting macOS 26.5+ exclusively, NSMapTable may also be used directly (the autoreleasepool blocking issue appears to have been fixed in that release).
 
 Here's a practical example: **IMKInputController doesn't hold any objects** but can establish weak-reference relationships with business module objects. For instance, an input method's business logic is a pure Swift `InputSession` object. Make it the delegate, but don't let IMKInputController hold it:
 
@@ -280,15 +278,29 @@ public final class InputSession: Sendable {
 
   // MARK: Internal
 
-  /// Retrieve an existing InputSession from cache (keyed by client NSObject's memory address).
+  /// Retrieve an existing InputSession from cache (keyed by the client object's integer RAM address).
   static func cachedSession(for clientObj: NSObject) -> InputSession? {
-    sessionsByClient.object(forKey: clientObj)
+    let addr = Int(bitPattern: Unmanaged.passUnretained(clientObj).toOpaque())
+    guard let idx = keys.firstIndex(of: addr) else { return nil }
+    let cached = values[idx]
+    // Move to front (most-recently-used)
+    keys.remove(at: idx)
+    values.remove(at: idx)
+    keys.insert(addr, at: 0)
+    values.insert(cached, at: 0)
+    return cached
   }
 
   /// Register this instance in the cache. Call when first constructing InputSession.
   func registerInCache() {
     guard let clientObj = theClient() else { return }
-    Self.sessionsByClient.setObject(self, forKey: clientObj)
+    let addr = Int(bitPattern: Unmanaged.passUnretained(clientObj).toOpaque())
+    Self.keys.insert(addr, at: 0)
+    Self.values.insert(self, at: 0)
+    if Self.keys.count > Self.capacity {
+      Self.keys.removeLast()
+      Self.values.removeLast()
+    }
   }
 
   /// Reassign to a new MyIMKInputController (used on cache hits).
@@ -302,14 +314,18 @@ public final class InputSession: Sendable {
 
   private static var _current: InputSession?
 
-  // MARK: - Session Cache (Mitigates ARC pressure during high-frequency CapsLock switching)
+  // MARK: - Session Cache (LRU replaces NSMapTable to avoid autoreleasepool blocking)
 
-  /// Weak-key cache: maps client NSObject (weak reference) to InputSession (strong reference).
-  /// When the client is deallocated by ARC, the corresponding entry is automatically
-  /// removed on the next cache access.
-  private static var sessionsByClient = NSMapTable<NSObject, InputSession>.weakToStrongObjects()
+  /// LRU cache: fixed capacity 5, keyed by the client object's integer RAM address.
+  /// Unlike NSMapTable's weak-key approach, LRU never triggers autoreleasepool draining
+  /// when evicting entries, so it never blocks the runloop on macOS versions prior to 26.5.
+  private static let capacity = 5
+  private static var keys: [Int] = []
+  private static var values: [InputSession] = []
 }
 ```
+
+> **Note:** `Unmanaged.passUnretained` is safe here — the pointer is used only as a stable identity for the client object, never dereferenced. The client is guaranteed alive while `cachedSession(for:)` and `registerInCache()` execute (it is the current IMKTextInput client).
 
 ## 6. Write All Input Method Code as Swift Package Libraries
 

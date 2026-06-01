@@ -140,18 +140,16 @@ nonisolated public final class MyIMKInputController: IMKInputController, @unchec
 
 刚才提到的「在单个 client 接收文字输入时，用 CpLk 在中英输入法之间经常切换」的情况当中，为什么说 client 是相同的呢？因为这个 client 是 IMK 统一派发的 NSConnection Distributed Object，具有运存位址一致性。
 
-于是，这里有个简单的解法，就是用 NSMapTable 或者任何类似的「弱 Key 杂凑表」：Key 本身是对物件的「弱持有」的；在 Key Object 被析构之后，该 Table 下次自身被存取时，会连同这 Key 带 Value 一同移除。
+于是，这里有个解法：用客户端的记忆体位址当作快取键值。最直觉的弱键实作是 NSMapTable——Key 弱持有物件，Key Object 析构后该条目自动移除。**但 NSMapTable 在释放弱键时会在主线程同步触发 autoreleasepool 排乾（drain），在 macOS 26.5 之前的系统上可能同时阻塞输入法与 client app，导致 Chrome 随机 hang 机逾十秒。因此本文推荐使用纯 Swift 的 LRU 表：以客户端物件的整数 RAM 位址为键、容量固定为 5，彻底避开 autoreleasepool 纠缠。**
 
-这就好办了：**IMKInputController 不要持有任何物件**。具体的作法是把所有实际的业务逻辑放在一个额外的 Swift 型别（例如本范例里的 `InputSession`）中，并且只透过弱引用或 Lambda Expression 存取它。控制器自身只负责转发事件并建立/查询该业务物件的快取，而绝不直接强持有；这样每次切换输入法时，ARC 不会被迫释放或重建大量物件，且同一个 client 只会对应到一个 Session 物件。下面的范例示范了这种策略——使用 `NSMapTable` 以 client 的分布式物件为键，实作一个弱键强值的快取，并在 controller 初期化时查询或建立对应的 `InputSession`。
+这就好办了：**IMKInputController 不要持有任何物件**。具体的作法是把所有实际的业务逻辑放在一个额外的 Swift 型别（例如本范例里的 `InputSession`）中，并且只透过弱引用或 Lambda Expression 存取它。控制器自身只负责转发事件并建立/查询该业务物件的快取，而绝不直接强持有；这样每次切换输入法时，ARC 不会被迫释放或重建大量物件，且同一个 client 只会对应到一个 Session 物件。下面的范例示范了这种策略——使用纯 Swift 的 LRU 表（容量 5、以 client 的物件位址为键）实作会话快取，并在 controller 初期化时查询或建立对应的 `InputSession`。
 
 * `MyIMKInputController.core` 为 `weak`，可在会话结束时自动断开。  
 * `getClientProvider()` 产生一个安全的 Lambda Expression 供 `InputSession` 呼叫 client()，避免 controller 强持有 client。  
 * `callCoreAtLeastOnce(client:)` 在 MainActor 内运行，先于快取中寻找既有的 `InputSession`；如命中便重新绑定控制器，否则建立新的会话。
-* **会话建构子直接使用传入的 `inputClient` 参数。** 在 macOS 10.9 ~ 10.12 上，`super.init(server:delegate:client:)` 返回后 `self.client()` 仍回传 `nil`—这是 Distributed Object 的特性所致。IMK 使用 NSConnection 跨进程通讯，`client()` 返回的是 Distributed Object 代理（macOS 10.9 上的 `NSDistantObject` Mach port proxy）。代理物件的初期化并非同步完成：IMK 在建构子同步执行期间尚未完成与远端 client 物件的代理协商和建立。然而，建构子的 `inputClient` 参数本身就是这个 client 物件——可利用 `wrap`/`unwrap` 把它安全地传入 `mainSync` lambda expression，从而以 `mainSync` 同步完成 `callCoreAtLeastOnce(client:)`，使 `core` 在建构子返回时即保证为非 nil。当快取未命中而需新建 `InputSession` 时，先以传入的 client 物件建构静态 closure 作为临时的 `theClient`，再立即排入 `DispatchQueue.main.async` 脱手操作将其替换为正常的动态 `getClientProvider()`，确保 `NSMapTable` 弱键机制不因短暂的强持有而失效。
+* **会话建构子直接使用传入的 `inputClient` 参数。** 在 macOS 10.9 ~ 10.12 上，`super.init(server:delegate:client:)` 返回后 `self.client()` 仍回传 `nil`—这是 Distributed Object 的特性所致。IMK 使用 NSConnection 跨进程通讯，`client()` 返回的是 Distributed Object 代理（macOS 10.9 上的 `NSDistantObject` Mach port proxy）。代理物件的初期化并非同步完成：IMK 在建构子同步执行期间尚未完成与远端 client 物件的代理协商和建立。然而，建构子的 `inputClient` 参数本身就是这个 client 物件——可利用 `wrap`/`unwrap` 把它安全地传入 `mainSync` lambda expression，从而以 `mainSync` 同步完成 `callCoreAtLeastOnce(client:)`，使 `core` 在建构子返回时即保证为非 nil。当快取未命中而需新建 `InputSession` 时，先以传入的 client 物件建构静态 closure 作为临时的 `theClient`，再立即排入 `DispatchQueue.main.async` 脱手操作将其替换为正常的动态 `getClientProvider()`，避免短暂的强持有干扰 LRU 快取的键值稳定性。
 
-这仅是一个简化的样板，实际专案里你可以把这些概念封装成你自己的工厂/管理器。核心观念是让 `IMKInputController` 本身保持「干净」——没有长期住着的强参照，所有状态都摆在可以全局共用、以 client 为键的 session 物件里。
-
-> 额外注意：本文提到的 NSMapTable 方法在 macOS 26.5 系统下没有什么问题，但是在稍早版本为止的 macOS 系统下系统下可能会出现 Chrome 偶尔会 hang 十几秒的情况。目前的推论是 NSMapTable 在释放 weak key 的时候会呼叫 autoreleasepool 这样的强制释放操作、且该操作会同时对输入法与 client app 构成临时阻塞。因应此种情形，或许使用纯 Swift 的 LRU Table (容量设为 5) 更合适（以运存地址 Integer 为 Key）。笔者怀疑 macOS 26.5 对 InputMethodKit 可能做了与此有关的改进。
+这仅是一个简化的样板，实际专案里你可以把这些概念封装成你自己的工厂/管理器。核心观念是让 `IMKInputController` 本身保持「干净」——没有长期住着的强参照，所有状态都摆在可以全局共用、以 client 为键的 session 物件里。LRU 方案以固定容量 5 确保记忆体占用有界、绝不阻塞 runloop；若仅锁定 macOS 26.5+，NSMapTable 亦可直接使用（该版本疑似已修复 autoreleasepool 阻塞问题）。
 
 笔者这里举个例子：输入法业务模组是一个纯 Swift 的 Class `InputSession` 会话模组。当作 IMKInputController 的 Delegate Class，但 IMKInputController 不持有它。见下文：
 
@@ -271,15 +269,29 @@ public final class InputSession: Sendable {
 
   // MARK: Internal
 
-  /// 从快取中查询既有的 InputSession（以 client NSObject 的运存位址为键）。
+  /// 从快取中查询既有的 InputSession（以 client 物件的整数 RAM 位址为键）。
   static func cachedSession(for clientObj: NSObject) -> InputSession? {
-    sessionsByClient.object(forKey: clientObj)
+    let addr = Int(bitPattern: Unmanaged.passUnretained(clientObj).toOpaque())
+    guard let idx = keys.firstIndex(of: addr) else { return nil }
+    let cached = values[idx]
+    // 移至最前（最近使用）
+    keys.remove(at: idx)
+    values.remove(at: idx)
+    keys.insert(addr, at: 0)
+    values.insert(cached, at: 0)
+    return cached
   }
 
   /// 将自身登记至快取。首次建构 InputSession 时呼叫。
   func registerInCache() {
     guard let clientObj = theClient() else { return }
-    Self.sessionsByClient.setObject(self, forKey: clientObj)
+    let addr = Int(bitPattern: Unmanaged.passUnretained(clientObj).toOpaque())
+    Self.keys.insert(addr, at: 0)
+    Self.values.insert(self, at: 0)
+    if Self.keys.count > Self.capacity {
+      Self.keys.removeLast()
+      Self.values.removeLast()
+    }
   }
 
   /// 重新绑定至新的 MyIMKInputController（快取命中时使用）。
@@ -293,13 +305,18 @@ public final class InputSession: Sendable {
 
   private static var _current: InputSession?
 
-  // MARK: - Session 快取 (缓解 CapsLock 高频切换场景下的 ARC 压力)
+  // MARK: - Session 快取 (以 LRU 取代 NSMapTable，避免 autoreleasepool 阻塞)
 
-  /// 弱键快取：将 client NSObject（弱引用）映射至 InputSession（强引用）。
-  /// 当 client 被 ARC 回收后，对应条目会在下次存取时自动清除。
-  private static var sessionsByClient = NSMapTable<NSObject, InputSession>.weakToStrongObjects()
+  /// LRU 快取：固定容量 5，以客户端物件的整数 RAM 位址为键。
+  /// 与 NSMapTable 的弱键方案不同，LRU 不会在释放键值时触发 autoreleasepool 排乾，
+  /// 因此在 macOS 26.5 之前的系统上绝不会阻塞 runloop。
+  private static let capacity = 5
+  private static var keys: [Int] = []
+  private static var values: [InputSession] = []
 }
 ```
+
+> **注意：** `Unmanaged.passUnretained` 在此处是安全的——该指标仅用作客户端物件的稳定识别码，绝不会对其解引用。在 `cachedSession(for:)` 与 `registerInCache()` 执行期间，客户端物件保证存活（它正是当前的 IMKTextInput 客户端）。
 
 ## 6. 将输入法所有程式内容写成 Swift Package Library
 
