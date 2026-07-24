@@ -122,201 +122,71 @@ nonisolated public final class MyIMKInputController: IMKInputController, @unchec
 
 > 注意：`client()?` 是 MainActor 限定物件。你脫手可以，但脫手操作的 Lambda Expression 在呼叫 client() 方法時必須在 MainActor 上。
 
-## 5. IMKInputController 不要持有任何物件
+## 5. IMKInputController 必須是 MRC 管理且以極性路由
 
-這一點非常有必要。這裡先給出一個（筆者此前在其他場合提到過的）應用場景：
+### 5.1 IMKServer 的 Controller 洩漏缺陷（逆向工程發現）
 
-> macOS 10.12 的這個 CpLk 切換功能的本質不是中英文打字模式切換，而是輸入法切換。macOS 哪怕英文打字也是由一個專門的輸入法負責的。大部分英語鍵盤的電腦上，這個輸入法叫 Apple ABC，對應美規鍵盤。每個輸入法在剛被切換出來時，會觸發這個輸入法自身的 IMKInputController Instance 的創建以及其 activateServer 操作（以及可能有的一系列追加操作）。然後才是這個 Client 之前對接的輸入法的 IMKInputController 副本的 Deactivation。
->
-> 很多中英文混合打字的用戶經常會在 ABC 與中文輸入法之間來回切換。由於這種情況下兩者所服務的 IMKTextInput Client 是相同的，所以就出現了 MainActor 塞車。而且，過於高頻的來回切換，會給 IMKInputController 所用的 Objective-C ARC 帶來壓力。ARC 廢件釋放與物件交互都發生在 MainActor 上，必然會發生塞車。
->
-> 「在同一個 client 切換輸入法」的過程會牽涉到前後兩個 IMKInputController 副本各自的對 client() 的操作。輸入法開發者現在最佳的範式就是讓 deactivateServer 在 MainActor 上 Async 脫手操作、且不在 deactivateServer 階段做 client() API 的文字寫入/內容顯示交互，因為這種擦除操作會由系統代勞。但是，這個由系統代勞的擦除操作也是發生在 MainActor 上的。這就出現了 MainActor 的任務的時序衝突。InputMethodKit 內部應該是有自己的方式處理這個衝突，然而代價就是阻塞開銷。
+藉由對 InputMethodKit 在 macOS 10.9 Mavericks、10.15 Catalina 及 macOS 27 GoldenGate (arm64e) 的逆向工程調查，唯音輸入法專案發現了 IMKServer 內部 controller 生命週期管理的根本缺陷：
 
-這就導致那些經常用 CpLk 超高頻中英切換打字的使用者們必然會罵娘。但他們不知道問題爛在系統層面，於是就只能罵輸入法。或罵系統內建注音爛，或罵自己在用的副廠輸入法不修故障。
+1. IMKServer 內部以 `_private._controllers`（`NSMutableDictionary`）管理所有 `IMKInputController` 實例，key 為 `[NSNumber numberWithUnsignedLong:clientProxyAddr]`——即每次 init 時傳入的 client proxy 物件的記憶體位址。
 
-雖然目前的自力救濟方法就是「輸入法用戶關掉 macOS 內建的 CpLk 中英文輸入法切換」且「輸入法開發者給自己的輸入法實作原生的 CpLk 英文模式」。但 Apple 的市場策略似乎趨向於「不鼓勵使用者這麼做」。Apple Silicon 筆電剛剛問世時的筆電鍵盤左下角的地球鍵被當作輸入法輪流按鍵，就是這個理想想法的進一步延伸。
+2. **每次 CapsLock 切換都會建立全新的 DO/XPC proxy 物件**，其記憶體位址與舊 proxy 不同。舊 controller 的 dictionary key 永遠無法再被 lookup 命中——IMKServer 原廠的 controller 複用邏輯以 proxy 位址為鍵，CpLk 切換後該鍵已失效。舊 controller 成為**永不被清理的孤棄 controller**。
 
-於是乎，擺在開發者面前要做的事情還有兩個：其中一個是剛才講過的「該脫手的任務一定要脫手」；而另一個則是： **IMKInputController 不要持有任何物件**。
+3. IMKServer 雖提供 `sessionFinished:` 清理機制，但該方法是 per-client-proxy 的通知：CpLk 切換後舊 proxy 已被取代，IMKServer 不再為舊 proxy 派送任何訊息，`sessionFinished:` 永遠不會對孤棄 controller 觸發。**每次 CpLk 切換都產生一個永久洩漏的 controller。**
 
-剛才提到的「在單個 client 接收文字輸入時，用 CpLk 在中英輸入法之間經常切換」的情況當中，為什麼說 client 是相同的呢？因為這個 client 是 IMK 統一派發的 NSConnection Distributed Object，具有記憶體位址一致性。
+4. 孤棄 controller 持有的 client wrapper（macOS ≤10.15 為 `IPMDServerClientWrapper`；macOS 15 Sequoia 起拆分為 `_IPMDServerClientWrapperModern` 與 `_IPMDServerClientWrapperLegacy`）包含 `_xpcConnection`（NSXPCConnection）或 `_clientDOProxy`——這些連線資源同樣永久洩漏。IMK 以全域快取管理這些 wrapper，必須透過 private class method（`+terminateForClientXPCConn:` / `+terminateForClientDOProxy:`）才能將其移除。
 
-於是，這裡有個解法：用客戶端的記憶體位址當作快取鍵值。最直覺的弱鍵實作是 NSMapTable——Key 弱持有物件，Key Object 析構後該條目自動移除。**但 NSMapTable 在釋放弱鍵時會在主執行緒同步觸發 autoreleasepool 排乾（drain），在 macOS 26.5 之前的系統上可能同時阻塞輸入法與 client app，導致 Chrome 隨機 hang 機逾十秒。因此本文推薦使用純 Swift 的 LRU 表：以客戶端物件的整數 RAM 位址為鍵、容量固定為 5，徹底避開 autoreleasepool 糾纏。**
+5. macOS 15 Sequoia 起已移除 `+terminateForClient:`（無後綴版本），僅保留 XPC 與 DO 兩變體。
 
-這就好辦了：**IMKInputController 不要持有任何物件**。具體的作法是把所有實際的業務邏輯放在一個額外的 Swift 型別（例如本範例裡的 `InputSession`）中，並且只透過弱引用或 Lambda Expression 存取它。控制器自身只負責轉發事件並建立/查詢該業務物件的快取，而絕不直接強持有；這樣每次切換輸入法時，ARC 不會被迫釋放或重建大量物件，且同一個 client 只會對應到一個 Session 物件。下面的範例示範了這種策略——使用純 Swift 的 LRU 表（容量 5、以 client 的物件位址為鍵）實作會話快取，並在 controller 初期化時查詢或建立對應的 `InputSession`。
+6. ARC 模式下，retain/release 的高頻開銷在 CapsLock 快速切換時導致可感知的卡頓。停用 ARC（`-fno-objc-arc`）可徹底消除卡頓，但必須自行處理孤棄 controller 與殘留 XPC 連線的清理。
 
-* `MyIMKInputController.core` 為 `weak`，可在會話結束時自動斷開。  
-* `getClientProvider()` 產生一個安全的 Lambda Expression 供 `InputSession` 呼叫 client()，避免 controller 強持有 client。  
-* `callCoreAtLeastOnce(client:)` 在 MainActor 內運行，先於快取中尋找既有的 `InputSession`；如命中便重新綁定控制器，否則建立新的會話。
-* **會話建構子直接使用傳入的 `inputClient` 參數。** 在 macOS 10.9 ~ 10.12 上，`super.init(server:delegate:client:)` 返回後 `self.client()` 仍回傳 `nil`—這是 Distributed Object 的特性所致。IMK 使用 NSConnection 跨進程通訊，`client()` 返回的是 Distributed Object 代理（macOS 10.9 上的 `NSDistantObject` Mach port proxy）。代理物件的初期化並非同步完成：IMK 在建構子同步執行期間尚未完成與遠端 client 物件的代理協商和建立。然而，建構子的 `inputClient` 參數本身就是這個 client 物件——可利用 `wrap`/`unwrap` 把它安全地傳入 `mainSync` lambda expression，從而以 `mainSync` 同步完成 `callCoreAtLeastOnce(client:)`，使 `core` 在建構子返回時即保證為非 nil。當快取未命中而需新建 `InputSession` 時，先以傳入的 client 物件建構靜態 closure 作為臨時的 `theClient`，再立即排入 `DispatchQueue.main.async` 脫手操作將其替換為正常的動態 `getClientProvider()`，避免短暫的強持有干擾 LRU 快取的鍵值穩定性。
+### 5.2 修復方案：MRC + KVC Prune + 極性雙緩衝 Session 池
 
-這僅是一個簡化的樣板，實際專案裡你可以把這些概念封裝成你自己的工廠/管理器。核心觀念是讓 `IMKInputController` 本身保持「乾淨」——沒有長期住著的強參照，所有狀態都擺在可以全局共用、以 client 為鍵的 session 物件裡。LRU 方案以固定容量 5 確保記憶體佔用有界、絕不阻塞 runloop；若僅鎖定 macOS 26.5+，NSMapTable 亦可直接使用（該版本疑似已修復 autoreleasepool 阻塞問題）。
+基於上述發現，唯音輸入法專案採用了以下架構（代號「Phase 115」）：
 
-筆者這裡舉個例子：輸入法業務模組是一個純 Swift 的 Class `InputSession` 會話模組。當作 IMKInputController 的 Delegate Class，但 IMKInputController 不持有它。見下文：
+**a) IMK 交互層全面採用 MRC。** `IMKInputSessionController` target 以 `-fno-objc-arc` 編譯。所有 controller 的 alloc/dealloc/retain/release 均在 ObjC MRC 層完成。Swift 端僅透過 raw 記憶體位址（`uintptr_t`）與 controller 互動，不執行任何 Swift ARC 操作。
+
+**b) 以 KVC 清理孤棄 controller。** 每個 controller 在 init 時被分配一個單調遞增的 generation number。當 `_controllers` dictionary 超過 2 個條目時，自動找出 generation 最舊的非活躍 controller，透過 KVC（`[server valueForKeyPath:@"_private._controllers"] removeObjectForKey:oldKey]`）將其移除，使其在 MRC 下正常釋放。
+
+**c) 極性雙緩衝 Session 池。** 以 controller generation number 的奇偶性（`generation % 2`）將所有 controller 對映至兩枚 static `InputSession` singleton：偶數→session A，奇數→session B。每次 CpLk toggle 帶來的新 controller 自動對接至**另一個** session；上一個 session 保留不釋放，等待下一個同極性 controller 接手。此舉完全消除了 InputSession 的動態分配、LRU 淘汰邏輯，以及快取過期的風險。
+
+**d) 延遲釋放與 XPC 清理。** controller 在 `deactivateServer:` 後不會立即釋放，而是排程 3 秒後執行清理：釋放所有 blocks、呼叫 client wrapper 的 private `+terminateForClient*` class method（依序嘗試 `_IPMDServerClientWrapperModern` → `_IPMDServerClientWrapperLegacy` → `IPMDServerClientWrapper` 以向前相容 macOS 27）、清除 controller↔session 對照表。若 3 秒內 controller 被重新啟用（`activateServer:`），則取消排程、恢復正常服務。這確保了 CpLk 快速切換時不會出現「舊 controller 已死、新 controller 尚未就緒」的真空期。
+
+**e) Dangling pointer 防護。** `IMKControllerLifetimeTracker` singleton 在每次以 `takeUnretainedValue()` 解讀 raw 位址前複查 controller 是否仍存活。`unregisterSessionAddr` 僅在 session 仍歸屬於該 controller 時才清空 `inputControllerAssignedAddr`（防止已 reassign 給新 controller 的 session 被舊 controller 的延遲 dealloc 誤清）。`reassign` 同步清除舊 controller 在 `sessionAddrByControllerAddr` 中的殘留 mapping。
+
+**f) IME 選單注入。** `IMEMenuSputnik` 利用 ObjC Runtime 的 `class_addMethod` + `imp_implementationWithBlock` 將 Swift closure 直接註冊為 `IMKInputSessionController` 的 method IMP，無需 `@objc` Selector 暴露即可動態構建輸入法選單。選單注入兩項即時監測資料：(1) `IMKControllerLifetimeTracker` 所追蹤的 controller 存活數量；(2) 以 `task_vm_info.internal` 取得的 anonymous private memory 用量。選單開啟前會先呼叫 `purgeMallocZones()` 強制回收 allocator cache，以確保記憶體讀數真實。
+
+### 5.3 架構總結
+
+ARC 從 IMK dispatch 路徑中完全移除，CapsLock 卡頓徹底消除。兩枚 singleton session 取代 LRU 快取，極性路由消除了快取複雜度。KVC prune 路徑補償了 IMKServer 無法自行清理孤棄 controller 的缺陷。延遲釋放確保 XPC 連線被正確終止而非洩漏。
+
+以下為 controller 側架構的最小化示意：
 
 ```swift
-/// nonisolated 是 IMKStateSetting & IMKMouseHandling 協定要求的。
-/// 或者說，官方沒要求，但是是 Swift 相容性沒做好導致的現狀。
-@objc(MyIMKInputController) // 必須加上 ObjC，因為 IMK 是用 ObjC 寫的。
-nonisolated public final class MyIMKInputController: IMKInputController, @unchecked Sendable {
-  // MARK: Lifecycle
+// IMKInputSessionController（MRC 編譯的 .m 檔案）：
+// - Class-level static blocks 透過 raw address 向 Swift 分派。
+// - +IMKSwift_configureWithActivatingServer: 等在啟動時一次性設定。
 
-  /// 對用以設定委任物件的控制器型別進行初期化處理。
-  nonisolated override public init() {
-    super.init()
-  }
+// Swift 端——極性路由：
+public final class InputSession {
+  /// 兩枚預先配置的 singleton session。
+  fileprivate static let sessionEven = InputSession(preallocated: ())
+  fileprivate static let sessionOdd  = InputSession(preallocated: ())
 
-  /// 對用以設定委任物件的控制器型別進行初期化處理。
-  ///
-  /// inputClient 參數是客體應用側存在的用以藉由 IMKServer 伺服器向輸入法傳訊的物件。該物件始終遵守 IMKTextInput 協定。
-  /// - Remark: 所有由委任物件實裝的「被協定要求實裝的方法」都會有一個用來接受客體物件的參數。在 IMKInputController 內部的型別不需要接受這個參數，因為已經有「client()」這個參數存在了。
-  /// - Parameters:
-  ///   - server: IMKServer
-  ///   - delegate: 客體物件
-  ///   - inputClient: 用以接受輸入的客體應用物件
-  nonisolated override public init!(server: IMKServer!, delegate: Any!, client inputClient: Any!) {
-    // Note: this constuctor gets called everytime this IME gets switched to.
-    // This happens even if the client() is the same IMKTextInput instance.
-    super.init(server: server, delegate: delegate, client: inputClient)
-    // macOS 10.9 ~ 10.12 的相容性處理：此處得使用傳入的 client 參數，因為 `client()` 沒有就緒、是 nil。
-    // 在這些舊版系統上，IMK 尚未在 super.init 返回時就完成 client 物件的綁定，
-    // 因此 `client()` 在建構子同步執行期間始終回傳 nil，導致 Session 無法登記至快取。
-    // 穩妥的做法是使用當前建構子內傳入的 client 參數，可確保 IMK 已完成 client 綁定。
-    let senderRef = wrap(inputClient)
-    mainSync {
-      // Force initialization.
-      self.core = callCoreAtLeastOnce(client: unwrap(senderRef))
-    }
-  }
-
-  // MARK: Public
-
-  @MainActor
-  public var core: InputSession? {
-    get {
-      if let workingValue = _core { return workingValue }
-      let newValue = callCoreAtLeastOnce(client: nil) // <- 使用 `client()`。
-      self.core = newValue
-      return newValue
-    }
-    set {
-      _core = newValue
-    }
-  }
-
-  // MARK: Private
-
-  @MainActor
-  private weak var _core: InputSession? // <- 必須 `weak`，不然就是「持有」了。
-
-  nonisolated private func getClientProvider() -> (() -> InputSession.ClientObj?) {
-    { [weak self] in
-      self?.client() as? InputSession.ClientObj
-    }
-  }
-
-  nonisolated private func callCoreAtLeastOnce(client maybeClient: Any!) -> InputSession {
-    let senderRef = wrap(maybeClient)
-    return mainSync {
-      // 嘗試從快取中複用既有的 InputSession，以緩解 CapsLock 頻繁切換場景下的 ARC 壓力。
-      let maybeClientOnMain = unwrap(senderRef) as? NSObject
-      let clientObj = maybeClientOnMain ?? (self.client() as? NSObject)
-      if let clientObj, let cached = InputSession.cachedSession(for: clientObj) {
-        cached.reassign(to: self, clientProvider: getClientProvider())
-        vCLog("InputSession reused. ID: \(cached.id.uuidString)")
-        return cached
-      }
-      // 先用傳入的參數完成 InputSession 的初期化，其中包括了對這個 Session 的登記過程。
-      let newSession = InputSession(controller: self) {
-        clientObj as? InputSession.ClientObj
-      }
-      // 然後再用脫手操作給這個 Session 重新指派 clientProvider。
-      DispatchQueue.main.async { [weak self] in
-        guard let this = self else { return }
-        newSession.reassign(to: this, clientProvider: this.getClientProvider())
-      }
-      return newSession
-    }
+  /// 依 controller 的 generation parity 解析對應 session。
+  static func session(for ctlAddr: UInt) -> InputSession? {
+    let parity = IMKControllerLifetimeTracker.shared().generationForAddress( ctlAddr) % 2
+    return parity == 0 ? sessionEven : sessionOdd
   }
 }
 
-@MainActor
-public final class InputSession: Sendable {
-  // MARK: Lifecycle
-
-  public init(
-    controller inputController: MyIMKInputController?,
-    client inputClient: @escaping (() -> ClientObj?)
-  ) {
-    self.theClient = inputClient
-    self.inputControllerAssigned = inputController
-    construct(client: theClient()) // <- 這是單獨的專項建構子。
-    registerInCache()
-    print("InputSession constructed. ID: \(id.uuidString)")
-  }
-
-  nonisolated deinit {
-    print("InputSession deconstructing. ID: \(id.uuidString)")
-  }
-
-  // MARK: Public
-
-  public typealias ClientObj = IMKTextInput & NSObject
-
-  public var theClient: () -> ClientObj?
-
-  /// IMKInputController 副本。
-  public weak var inputControllerAssigned: MyIMKInputController?
-
-  // MARK: Internal
-
-  /// 從快取中查詢既有的 InputSession（以 client 物件的整數 RAM 位址為鍵）。
-  static func cachedSession(for clientObj: NSObject) -> InputSession? {
-    let addr = Int(bitPattern: Unmanaged.passUnretained(clientObj).toOpaque())
-    guard let idx = keys.firstIndex(of: addr) else { return nil }
-    let cached = values[idx]
-    // 移至最前（最近使用）
-    keys.remove(at: idx)
-    values.remove(at: idx)
-    keys.insert(addr, at: 0)
-    values.insert(cached, at: 0)
-    return cached
-  }
-
-  /// 將自身登記至快取。首次建構 InputSession 時呼叫。
-  func registerInCache() {
-    guard let clientObj = theClient() else { return }
-    let addr = Int(bitPattern: Unmanaged.passUnretained(clientObj).toOpaque())
-    Self.keys.insert(addr, at: 0)
-    Self.values.insert(self, at: 0)
-    if Self.keys.count > Self.capacity {
-      Self.keys.removeLast()
-      Self.values.removeLast()
-    }
-  }
-
-  /// 重新綁定至新的 MyIMKInputController（快取命中時使用）。
-  /// 僅更新控制器參照與 clientProvider ，不重新建構打字模組。
-  func reassign(to controller: MyIMKInputController, clientProvider: @escaping () -> ClientObj?) {
-    inputControllerAssigned = controller
-    theClient = clientProvider
-  }
-
-  // MARK: Private
-
-  private static var _current: InputSession?
-
-  // MARK: - Session 快取 (以 LRU 取代 NSMapTable，避免 autoreleasepool 阻塞)
-
-  /// LRU 快取：固定容量 5，以客戶端物件的整數 RAM 位址為鍵。
-  /// 與 NSMapTable 的弱鍵方案不同，LRU 不會在釋放鍵值時觸發 autoreleasepool 排乾，
-  /// 因此在 macOS 26.5 之前的系統上絕不會阻塞 runloop。
-  private static let capacity = 5
-  private static var keys: [Int] = []
-  private static var values: [InputSession] = []
-}
+// SessionControllerSputnik.callCoreAtLeastOnce:
+// 1. 由 controller generation 決定 parity。
+// 2. 路由至 sessionEven 或 sessionOdd。
+// 3. 重新指派 client provider（無快取查詢、無淘汰邏輯）。
 ```
 
-> **注意：** `Unmanaged.passUnretained` 在此處是安全的——該指標僅用作客戶端物件的穩定識別碼，絕不會對其解引用。在 `cachedSession(for:)` 與 `registerInCache()` 執行期間，客戶端物件保證存活（它正是當前的 IMKTextInput 客戶端）。
+> **注意：** 極性池刻意不以 client 位址為鍵。它接受 CapsLock 切換會產生不同位址的新 proxy 這一現實，改以 controller generation parity——一個穩定、單調遞增的計數器——作為路由鍵。兩個 session 的上限是充分的，因為同時最多只有兩個 controller 可能活躍（當前的一個與正在被 deactivate 的一個）。
 
 ## 6. 將輸入法所有程式內容寫成 Swift Package Library
 

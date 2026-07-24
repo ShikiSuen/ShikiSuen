@@ -124,208 +124,71 @@ Therefore, all Client methods *except* `client()?.setMarkedText` & `client()?.in
 
 > Note: `client()?` is a MainActor-confined object. You can async-run, but the lambda expression calling Client methods must run on the MainActor.
 
-## 5. IMKInputController Must Not Hold Anything
+## 5. IMKInputController Must Be MRC-Managed and Parity-Routed
 
-This is critically important. Here's a scenario (I've mentioned this previously):
+### 5.1 The IMKServer Controller-Leak Flaw (Reverse‑Engineered)
 
-> macOS 10.12's CapsLock toggle isn't fundamentally a Chinese/English input mode switch—it's an input method switch. On macOS, even English input is handled by a dedicated input method. On most English keyboards, this is called Apple ABC (corresponding to the US layout). Each time an input method is switched to, it triggers the creation of a new IMKInputController instance for that method and its `activateServer` operation (plus potentially other follow-up operations). Only afterward does the previous input method's IMKInputController instance undergo deactivation.
->
-> Users frequently mixing Chinese and English often switch back-and-forth between ABC and a Chinese input method. Because both serve the same IMKTextInput Client, MainActor congestion occurs. Moreover, high-frequency switching stresses the ARC reference counting used by IMKInputController. Both ARC cleanup and object interaction occur on the MainActor, inevitably causing contention.
->
-> The process of "switching input methods on the same client" involves both IMKInputController instances operating on the same `client()`. The optimal pattern is to have `deactivateServer` async-run on the MainActor and avoid text writing/display interactions with `client()` during deactivation, since the system handles cleanup automatically. However, this system-managed cleanup also occurs on the MainActor, causing task sequence conflicts. InputMethodKit likely has internal mechanisms to handle this, but the cost is blocking overhead.
+Through extensive reverse engineering of InputMethodKit across macOS 10.9 Mavericks, 10.15 Catalina, and macOS 27 GoldenGate (arm64e), the vChewing project uncovered a fundamental defect in IMKServer's internal controller lifecycle management:
 
-This results in frustrated users who frequently CapsLock-switch between input methods experiencing lag. But they don't realize the problem lies at the system level—they blame the input method. Some complain that macOS's built-in Zhuyin is broken; others fault the third-party input method they're using.
+1. IMKServer internally maintains `_private._controllers` — an `NSMutableDictionary` keyed by `[NSNumber numberWithUnsignedLong:clientProxyAddr]` — to track all `IMKInputController` instances. The key is the memory address of the client proxy object passed to each controller at `init`.
 
-Though the current workaround is "disable macOS's built-in CapsLock input method switching" and "implement native CapsLock English mode in your input method," Apple's market strategy seems to discourage this. The Globe key on the first-generation Apple Silicon MacBook keyboards being repurposed as an input method rotation key reflects Apple's ongoing push toward its idealized vision.
+2. **Every CapsLock toggle creates a brand-new DO/XPC proxy object** with a different memory address. The old controller's dictionary key can never be hit by a lookup again, because IMKServer's built-in controller reuse logic is keyed on the proxy address that has now changed. The old controller becomes permanently orphaned.
 
-This leaves developers with two tasks: one we covered earlier ("async-run appropriate tasks"), and another: **IMKInputController must not hold any objects**.
+3. IMKServer provides `sessionFinished:` to clean up accumulated controllers for a given app, but `sessionFinished:` is dispatched per-client-proxy. After a CapsLock toggle, the old proxy has been replaced; IMKServer no longer sends any messages to it, so `sessionFinished:` is never triggered for the orphaned controller. **Each CapsLock toggle produces a permanently leaked controller.**
 
-Why is the client identical across different input method switches? Because this client is an NSConnection Distributed Object uniformly dispatched by IMK, possessing memory address consistency. This is the crucial detail that makes the weak-key solution viable.
+4. The orphaned controller holds a client wrapper (`IPMDServerClientWrapper` on macOS ≤ 10.15; split into `_IPMDServerClientWrapperModern` and `_IPMDServerClientWrapperLegacy` on macOS 15 Sequoia and later) which in turn holds `_xpcConnection` (NSXPCConnection) or `_clientDOProxy` — these connection resources are also permanently leaked. IMK manages these wrappers via a global cache, and they can only be removed by calling private class methods (`+terminateForClientXPCConn:`, `+terminateForClientDOProxy:`).
 
-The most intuitive approach is to use an `NSMapTable` (or any equivalent weak‑key hash) where the *key* is a weak reference to the client object. When the client deallocates, the table automatically ejects the entry on next access. **However, `NSMapTable` synchronously triggers autoreleasepool draining on the main thread when releasing a weak key, which can simultaneously block both the IME and the client app on macOS versions prior to 26.5—observed as random ≤20‑second hangs in Chrome. Therefore, a pure‑Swift LRU table (capacity 5, keyed by the client object's integer RAM address) is the recommended approach, completely sidestepping the autoreleasepool entanglement.**
+5. From macOS 15 Sequoia onward, `+terminateForClient:` (the unsuffixed version) has been removed entirely; only the XPC and DO variants remain.
 
-The practical upshot is: **IMKInputController holds no objects itself**. Instead you maintain a separate business‑logic class and access it via weak references or provider lambda expressions. In the sample below `InputSession` represents such a session object. The controller merely looks up (or creates) the session in a global LRU cache keyed by the client's address, then forwards events. This keeps the controller “clean”: it never retains the session, nor the client, avoiding ARC churn when input methods are switched rapidly.
+6. Under ARC, the retain/release churn from frequent CapsLock switching can cause perceptible stutter. Disabling ARC (`-fno-objc-arc`) eliminates the stutter completely, but then you must handle orphaned controller cleanup and residual XPC connection teardown manually.
 
-Key points of the example:
+### 5.2 The Fix: MRC + KVC Prune + Parity-Based Session Pool
 
-- `MyIMKInputController.core` is a `weak` property; the session can outlive the controller and the reference will nil‑out automatically.
-- `getClientProvider()` returns a lambda expression that safely invokes `client()` without trapping a strong reference to the controller.
-- `callCoreAtLeastOnce(client:)` is executed on the MainActor; it first tries to reuse an existing `InputSession` from the cache (mitigating ARC pressure during CapsLock spam), reassigning it to the new controller if found. Otherwise it constructs a fresh session.
-- **The constructor can use the provided `inputClient` parameter directly.** On macOS 10.9 ~ 10.12, `client()` still returns `nil` even after `super.init(server:delegate:client:)` returns—this is due to the nature of Distributed Objects. IMK uses NSConnection for cross-process communication, and `client()` returns a Distributed Object proxy (the `NSDistantObject` Mach port proxy on macOS 10.9). Proxy object initialization is not synchronous: IMK has not yet completed the proxy negotiation and establishment with the remote client object during synchronous constructor execution. However, the constructor’s `inputClient` parameter *is* the client object—using `wrap`/`unwrap` to safely pass it into the `mainSync` lambda expression, `callCoreAtLeastOnce(client:)` can run synchronously, ensuring `core` is guaranteed non-nil when the constructor returns. When a cache miss requires a new `InputSession`, the session is first created with a static lambda expression capturing the passed-in client, then a `DispatchQueue.main.async` block immediately replaces it with the proper dynamic `getClientProvider()`, so the brief strong capture does not interfere with the LRU cache's key stability.
+Given these findings, the vChewing project adopted the following architecture (codename "Phase 115"):
 
-This is only a minimal template—you can wrap the caching logic inside your own factory or manager in a real project. The essential concept is that all state lives in sharable session objects keyed by client; the IMKInputController itself is just a thin, non‑holding facade. The LRU approach guarantees bounded memory (fixed capacity 5) and never blocks the runloop; if targeting macOS 26.5+ exclusively, NSMapTable may also be used directly (the autoreleasepool blocking issue appears to have been fixed in that release).
+**a) Full MRC for the IMK interaction layer.** The `IMKInputSessionController` target is compiled with `-fno-objc-arc`. All controller alloc/dealloc/retain/release happens in the ObjC MRC layer. The Swift side interacts with controllers only through raw memory addresses (`uintptr_t`), never performing Swift ARC operations on controller instances.
 
-Here's a practical example: **IMKInputController doesn't hold any objects** but can establish weak-reference relationships with business module objects. For instance, an input method's business logic is a pure Swift `InputSession` object. Make it the delegate, but don't let IMKInputController hold it:
+**b) KVC-based orphaned controller pruning.** A monotonically increasing generation number is assigned to each controller at init. When the `_controllers` dictionary exceeds 2 entries, the oldest inactive controller (lowest generation) is removed via KVC: `[server valueForKeyPath:@"_private._controllers"] removeObjectForKey:oldKey]`. This prunes orphaned controllers in MRC so they are properly deallocated.
+
+**c) Parity-based double-buffered session pool.** Instead of an LRU cache of arbitrary capacity, the controller's generation number parity (`generation % 2`) maps to one of exactly two static `InputSession` singletons: even → session A, odd → session B. Each CapsLock toggle brings a new controller that is routed to the *other* session; the previous session is retained, waiting for the next same-parity controller to take over. This eliminates dynamic allocation, LRU eviction logic, and any risk of session cache staleness.
+
+**d) Delayed dealloc with XPC cleanup.** After `deactivateServer:`, the controller is not immediately deallocated. Instead, a 3-second timer is started. When it fires, the controller: releases all blocks, invokes the private `+terminateForClient*` class methods on the appropriate client wrapper class (falling back through `_IPMDServerClientWrapperModern` → `_IPMDServerClientWrapperLegacy` → `IPMDServerClientWrapper` for forward compatibility with macOS 27), and clears the controller↔session mapping. If the controller is reactivated within 3 seconds (`activateServer:`), the timer is cancelled and normal service resumes. This prevents a "dead controller, not-yet-ready new controller" gap during rapid CapsLock toggling.
+
+**e) Dangling pointer protection.** An `IMKControllerLifetimeTracker` singleton verifies controller liveness before every `takeUnretainedValue()` call on a raw address. The `unregisterSessionAddr` path only clears `inputControllerAssignedAddr` if the session still belongs to that controller — preventing a reassigned session from being wiped by a stale controller's delayed dealloc. The `reassign` path simultaneously cleans up the old controller's stale mapping in `sessionAddrByControllerAddr`.
+
+**f) IME menu injection via ObjC runtime.** The IME menu is dynamically built by `IMEMenuSputnik` which uses `class_addMethod` + `imp_implementationWithBlock` to register Swift closures directly as method IMPs on `IMKInputSessionController`. No `@objc` selector exposure is needed. The menu injects two live metrics: (1) the count of alive controller instances tracked by `IMKControllerLifetimeTracker`, and (2) anonymous private memory usage obtained from `task_vm_info.internal`. Before each menu open, `purgeMallocZones()` is called to flush allocator caches so the memory reading reflects actual usage.
+
+### 5.3 Architectural Summary
+
+The net effect is that ARC is fully removed from the IMK dispatch path, eliminating CapsLock stutter. The two-singleton session pool eliminates LRU cache complexity. The KVC prune path compensates for IMKServer's inability to clean up orphaned controllers on its own. The delayed dealloc ensures XPC connections are properly terminated rather than leaked.
+
+Below is a minimal sketch of the controller-side architecture:
 
 ```swift
-/// nonisolated is required by the IMKStateSetting & IMKMouseHandling protocols.
-/// Technically, Apple doesn't require it, but the header's Swift compatibility was not well-designed.
-@objc(MyIMKInputController) // @objc is mandatory because IMK is written in Objective-C.
-nonisolated public final class MyIMKInputController: IMKInputController, @unchecked Sendable {
-  // MARK: Lifecycle
+// IMKInputSessionController (MRC-compiled .m file):
+// - Class-level static blocks dispatch to Swift via raw addresses.
+// - +IMKSwift_configureWithActivatingServer: etc. set once at startup.
 
-  /// Initialize the controller for setting the delegate object.
-  nonisolated override public init() {
-    super.init()
-  }
+// Swift side — parity-based session routing:
+public final class InputSession {
+  /// The two preallocated singleton sessions.
+  fileprivate static let sessionEven = InputSession(preallocated: ())
+  fileprivate static let sessionOdd  = InputSession(preallocated: ())
 
-  /// Initialize the controller for setting the delegate object.
-  ///
-  /// The inputClient parameter is the object on the client application side that communicates with the input method via IMKServer. This object always conforms to the IMKTextInput protocol.
-  /// - Remark: All methods required by the delegate protocol implementations will have a parameter accepting the client object. Within IMKInputController, you don't need this parameter because the `client()` accessor already exists.
-  /// - Parameters:
-  ///   - server: IMKServer
-  ///   - delegate: The client object
-  ///   - inputClient: The client application object receiving input
-  nonisolated override public init!(server: IMKServer!, delegate: Any!, client inputClient: Any!) {
-    // Note: this constructor gets called every time this IME gets switched to.
-    // This happens even if the client() is the same IMKTextInput instance.
-    super.init(server: server, delegate: delegate, client: inputClient)
-    // Compatibility with macOS 10.9 ~ 10.12: use the provided client parameter because
-    // `client()` is not ready yet—it is nil.
-    // On these older systems, IMK has not finished binding the client object by the time
-    // super.init returns, so `client()` always returns nil during synchronous constructor
-    // execution. This means that the session cannot be registered in the cache.
-    // The reliable approach is to use the constructor’s inputClient parameter directly,
-    // ensuring the client object is available regardless of IMK’s binding timing.
-    let senderRef = wrap(inputClient)
-    mainSync {
-      // Force initialization.
-      self.core = callCoreAtLeastOnce(client: unwrap(senderRef))
-    }
-  }
-
-  // MARK: Public
-
-  @MainActor
-  public var core: InputSession? {
-    get {
-      if let workingValue = _core { return workingValue }
-      let newValue = callCoreAtLeastOnce(client: nil) // <- Use `client()`.
-      self.core = newValue
-      return newValue
-    }
-    set {
-      _core = newValue
-    }
-  }
-
-  // MARK: Private
-
-  @MainActor
-  private weak var _core: InputSession? // <- Use `weak`, don't HOLD.
-
-  nonisolated private func getClientProvider() -> (() -> InputSession.ClientObj?) {
-    { [weak self] in
-      self?.client() as? InputSession.ClientObj
-    }
-  }
-
-  nonisolated private func callCoreAtLeastOnce(client maybeClient: Any!) -> InputSession {
-    let senderRef = wrap(maybeClient)
-    return mainSync {
-      // Attempt to reuse an existing InputSession from cache to mitigate ARC
-      // pressure during high-frequency CapsLock switching scenarios.
-      let maybeClientOnMain = unwrap(senderRef) as? NSObject
-      let clientObj = maybeClientOnMain ?? (self.client() as? NSObject)
-      if let clientObj, let cached = InputSession.cachedSession(for: clientObj) {
-        cached.reassign(to: self, clientProvider: getClientProvider())
-        vCLog("InputSession reused. ID: \(cached.id.uuidString)")
-        return cached
-      }
-      // First create the InputSession with the passed-in client parameter,
-      // which also triggers cache registration.
-      let newSession = InputSession(controller: self) {
-        clientObj as? InputSession.ClientObj
-      }
-      // Then async-reassign with the proper dynamic clientProvider.
-      DispatchQueue.main.async { [weak self] in
-        guard let this = self else { return }
-        newSession.reassign(to: this, clientProvider: this.getClientProvider())
-      }
-      return newSession
-    }
+  /// Resolve the session for a given controller's generation parity.
+  static func session(for ctlAddr: UInt) -> InputSession? {
+    let parity = IMKControllerLifetimeTracker.shared().generationForAddress( ctlAddr) % 2
+    return parity == 0 ? sessionEven : sessionOdd
   }
 }
 
-@MainActor
-public final class InputSession: Sendable {
-  // MARK: Lifecycle
-
-  public init(
-    controller inputController: MyIMKInputController?,
-    client inputClient: @escaping (() -> ClientObj?)
-  ) {
-    self.theClient = inputClient
-    self.inputControllerAssigned = inputController
-    construct(client: theClient()) // <- This is a separate specialized constructor.
-    registerInCache()
-    print("InputSession constructed. ID: \(id.uuidString)")
-  }
-
-  nonisolated deinit {
-    print("InputSession deconstructing. ID: \(id.uuidString)")
-  }
-
-  // MARK: Public
-
-  public typealias ClientObj = IMKTextInput & NSObject
-
-  public var theClient: () -> ClientObj?
-
-  /// The assigned IMKInputController instance.
-  public weak var inputControllerAssigned: MyIMKInputController?
-
-  // MARK: Internal
-
-  /// Retrieve an existing InputSession from cache (keyed by the client object's integer RAM address).
-  static func cachedSession(for clientObj: NSObject) -> InputSession? {
-    let addr = Int(bitPattern: Unmanaged.passUnretained(clientObj).toOpaque())
-    guard let idx = keys.firstIndex(of: addr) else { return nil }
-    let cached = values[idx]
-    // Move to front (most-recently-used)
-    keys.remove(at: idx)
-    values.remove(at: idx)
-    keys.insert(addr, at: 0)
-    values.insert(cached, at: 0)
-    return cached
-  }
-
-  /// Register this instance in the cache. Call when first constructing InputSession.
-  func registerInCache() {
-    guard let clientObj = theClient() else { return }
-    let addr = Int(bitPattern: Unmanaged.passUnretained(clientObj).toOpaque())
-    Self.keys.insert(addr, at: 0)
-    Self.values.insert(self, at: 0)
-    if Self.keys.count > Self.capacity {
-      Self.keys.removeLast()
-      Self.values.removeLast()
-    }
-  }
-
-  /// Reassign to a new MyIMKInputController (used on cache hits).
-  /// Only updates controller and client references; doesn't reconstruct the typing module.
-  func reassign(to controller: MyIMKInputController, clientProvider: @escaping () -> ClientObj?) {
-    inputControllerAssigned = controller
-    theClient = clientProvider
-  }
-
-  // MARK: Private
-
-  private static var _current: InputSession?
-
-  // MARK: - Session Cache (LRU replaces NSMapTable to avoid autoreleasepool blocking)
-
-  /// LRU cache: fixed capacity 5, keyed by the client object's integer RAM address.
-  /// Unlike NSMapTable's weak-key approach, LRU never triggers autoreleasepool draining
-  /// when evicting entries, so it never blocks the runloop on macOS versions prior to 26.5.
-  private static let capacity = 5
-  private static var keys: [Int] = []
-  private static var values: [InputSession] = []
-}
+// SessionControllerSputnik.callCoreAtLeastOnce:
+// 1. Determine parity from controller generation.
+// 2. Route to sessionEven or sessionOdd.
+// 3. Reassign client provider (no cache lookup, no eviction).
 ```
 
-> **Note:** `Unmanaged.passUnretained` is safe here — the pointer is used only as a stable identity for the client object, never dereferenced. The client is guaranteed alive while `cachedSession(for:)` and `registerInCache()` execute (it is the current IMKTextInput client).
+> **Note:** The parity-based pool is intentionally *not* keyed by client address. It embraces the reality that CapsLock toggles create new proxy objects with different addresses, and instead uses controller generation parity — a stable, monotonically increasing counter — as the routing key. The two-session limit is sufficient because at most two controllers can be active simultaneously (the current one and the one being deactivated).
 
 ## 6. Write All Input Method Code as Swift Package Libraries
 
