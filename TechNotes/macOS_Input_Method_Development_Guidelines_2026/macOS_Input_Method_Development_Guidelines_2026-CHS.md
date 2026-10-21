@@ -1,8 +1,8 @@
 # 写在2026年的macOS输入法开发规范
 
-InputMethodKit 自 macOS 10.5 Leopard 时代问世，早于 Objective-C ARC 技术、XPC 通讯技术、Sandbox 技术问世（均为 macOS 10.7）之前。自然，这也是早于 Swift 5 与 SwiftUI 流行之前。也就是说，InputMethodKit 是横跨了两代技术大变革的祖产级 OS Framework。当年 Apple 写给 macOS 10.5 Leopard 的 IMK 参考手册《[Input Method Kit Framework Reference](https://leopard-adc.pepas.com/documentation/Cocoa/Reference/InputMethodKitFrameworkRef/InputMethodKitFrameworkRef.pdf)》（下文简称《IMKFR》）早已不符合这些变革所带来的新要求（特别是 Swift 6 Concurrency）。笔者根据自己开发[《唯音输入法》(for macOS 10.09 Mavericks ~ macOS 26)](https://vchewing.github.io/)的经验，将一些注意事项整理在此，留给其他想给 macOS 开发输入法的工程师们参考。
+InputMethodKit 自 macOS 10.5 Leopard 时代问世，早于 Objective-C ARC 技术、XPC 通讯技术、Sandbox 技术问世（均为 macOS 10.7）之前。自然，这也是早于 Swift 5 与 SwiftUI 流行之前。也就是说，InputMethodKit 是横跨了两代技术大变革的祖产级 OS Framework。当年 Apple 写给 macOS 10.5 Leopard 的 IMK 参考手册《[Input Method Kit Framework Reference](https://leopard-adc.pepas.com/documentation/Cocoa/Reference/InputMethodKitFrameworkRef/InputMethodKitFrameworkRef.pdf)》（下文简称《IMKFR》）早已不符合这些变革所带来的新要求（特别是 Swift 6 Concurrency）。笔者根据自己开发[《唯音输入法》(for macOS 10.09 Mavericks ~ macOS 27)](https://vchewing.github.io/)的经验，将一些注意事项整理在此，留给其他想给 macOS 开发输入法的工程师们参考。
 
-> 笔者另外制作了 [IMKSwift](https://github.com/vChewing/IMKSwift) 套件，允许 Swift 工程师们在写 IMK 输入法时更顺利：IMKSwift 提供了 IMKInputSessionController 基础型别、是在 IMKInputController 的基础上整体换用了对 Modern Swift Concurrency 更友好的 ObjC Header 表达。使用这个套件的话，下文某些繁文缛节或可不必严苛遵守。
+> 笔者另外制作了 [IMKSwift](https://github.com/vChewing/IMKSwift) 套件，允许 Swift 工程师们在写 IMK 输入法时更顺利：IMKSwift 提供了 IMKInputSessionController 基础型别、是在 IMKInputController 的基础上整体换用了对 Modern Swift Concurrency 更友好的 ObjC Header 表达。该套件另已内置 §5 所述的 MRC 私有面层；下文 §5 的实现细节可以当作参考实现，而非待办清单。
 
 ## 1. NSConnection 名称
 
@@ -122,71 +122,97 @@ nonisolated public final class MyIMKInputController: IMKInputController, @unchec
 
 > 注意：`client()?` 是 MainActor 限定物件。你脱手可以，但脱手操作的 Lambda Expression 在呼叫 client() 方法时必须在 MainActor 上。
 
-## 5. IMKInputController 必须是 MRC 管理且以极性路由
+## 5. IMKInputController 必须是 MRC 管理，且客体绑定必须逐事件重建
 
-### 5.1 IMKServer 的 Controller 泄漏缺陷（逆向工程发现）
+### 5.1 IMKServer 控制器泄漏缺陷（逆向工程结论）
 
-藉由对 InputMethodKit 在 macOS 10.9 Mavericks、10.15 Catalina 及 macOS 27 GoldenGate (arm64e) 的逆向工程调查，唯音输入法项目发现了 IMKServer 内部 controller 生命周期管理的根本缺陷：
+笔者针对 InputMethodKit 在 macOS 10.9 Mavericks、10.15 Catalina 与 macOS 27 GoldenGate（arm64e）上做了大量逆向工程，发现 IMKServer 在控制器生命周期管理上有一个根本缺陷：
 
-1. IMKServer 内部以 `_private._controllers`（`NSMutableDictionary`）管理所有 `IMKInputController` 实例，key 为 `[NSNumber numberWithUnsignedLong:clientProxyAddr]`——即每次 init 时传入的 client proxy 对象的内存位址。
+1. IMKServer 内部以 `_private._controllers` 这个 `NSMutableDictionary` 追踪所有 `IMKInputController` 实例，键是 `[NSNumber numberWithUnsignedLong:clientProxyAddr]`——也就是每个控制器在 `init` 时所收到的客体代理对象的地址。
 
-2. **每次 CapsLock 切换都会建立全新的 DO/XPC proxy 对象**，其内存位址与旧 proxy 不同。旧 controller 的 dictionary key 永远无法再被 lookup 命中——IMKServer 原厂的 controller 复用逻辑以 proxy 位址为键，CpLk 切换后该键已失效。旧 controller 成为**永不被清理的孤弃 controller**。
+2. **每一次 CapsLock 切换都会产生一个全新的 DO/XPC 代理对象**，地址不同。旧控制器在字典里的键从此再也查不到，因为 IMKServer 内建的控制器重用逻辑是以业已改变的代理地址为键。旧控制器就此成为永久的孤儿。
 
-3. IMKServer 虽提供 `sessionFinished:` 清理机制，但该方法是 per-client-proxy 的通知：CpLk 切换后旧 proxy 已被取代，IMKServer 不再为旧 proxy 派送任何讯息，`sessionFinished:` 永远不会对孤弃 controller 触发。**每次 CpLk 切换都产生一个永久泄漏的 controller。**
+3. IMKServer 有 `sessionFinished:` 可以清理某个 App 累积下来的控制器，但 `sessionFinished:` 是按客体代理逐一派发的。CapsLock 一换，旧代理已被替换，IMKServer 不会再对它发任何消息，于是孤儿控制器永远收不到 `sessionFinished:`。**每切一次 CapsLock，就漏掉一个控制器。**
 
-4. 孤弃 controller 持有的 client wrapper（macOS ≤10.15 为 `IPMDServerClientWrapper`；macOS 15 Sequoia 起拆分为 `_IPMDServerClientWrapperModern` 与 `_IPMDServerClientWrapperLegacy`）包含 `_xpcConnection`（NSXPCConnection）或 `_clientDOProxy`——这些连线资源同样永久泄漏。IMK 以全域缓存管理这些 wrapper，必须透过 private class method（`+terminateForClientXPCConn:` / `+terminateForClientDOProxy:`）才能将其移除。
+4. 孤儿控制器持有客体连接包装对象（macOS ≤ 10.15 为 `IPMDServerClientWrapper`；macOS 15 Sequoia 起拆为 `_IPMDServerClientWrapperModern` 与 `_IPMDServerClientWrapperLegacy`），其内又持有 `_xpcConnection`（NSXPCConnection）或 `_clientDOProxy`——这些连接资源同样永久泄漏。IMK 以全局缓存管理这些包装对象，只能通过私有的类方法（`+terminateForClientXPCConn:`、`+terminateForClientDOProxy:`）移除。
 
-5. macOS 15 Sequoia 起已移除 `+terminateForClient:`（无后缀版本），仅保留 XPC 与 DO 两变体。
+5. macOS 15 Sequoia 起，无后缀的 `+terminateForClient:` 已被完全移除，只剩 XPC 与 DO 两个变体。
 
-6. ARC 模式下，retain/release 的高频开销在 CapsLock 快速切换时导致可感知的卡顿。停用 ARC（`-fno-objc-arc`）可彻底消除卡顿，但必须自行处理孤弃 controller 与残留 XPC 连线的清理。
+6. 在 ARC 之下，频繁 CapsLock 切换造成的 retain/release churn 会导致可感知的卡顿。关闭 ARC（`-fno-objc-arc`）可以完全消除卡顿，但从那以后孤儿控制器的清理与残余 XPC 连接的拆除，都得自己来。
 
-### 5.2 修复方案：MRC + KVC Prune + 极性双缓冲 Session 池
+7. **孤儿不只是被漏掉——它还保留着退役当时的客体绑定。** 框架里没有任何东西会再更新那个绑定，因为框架里没有任何东西还认为这个控制器在服役。系统此后投给这个控制器的按键，都会以一个已退役客体的身份被回应。
 
-基于上述发现，唯音输入法项目采用了以下架构（代号「Phase 115」）：
+### 5.2 修法：MRC ＋ KVC 修剪 ＋ 按地址索引的会话池 ＋ 逐事件认领
 
-**a) IMK 交互层全面采用 MRC。** `IMKInputSessionController` target 以 `-fno-objc-arc` 编译。所有 controller 的 alloc/dealloc/retain/release 均在 ObjC MRC 层完成。Swift 端仅透过 raw 内存位址（`uintptr_t`）与 controller 交互，不执行任何 Swift ARC 操作。
+**a) IMK 交互层全面改用 MRC。** `IMKInputSessionController` 的 target 以 `-fno-objc-arc` 编译，控制器的 alloc/dealloc/retain/release 全在 ObjC MRC 层完成。Swift 端只通过原始运存地址（`uintptr_t`）与控制器互动，绝不对控制器实例做 Swift ARC 操作。
 
-**b) 以 KVC 清理孤弃 controller。** 每个 controller 在 init 时被分配一个单调递增的 generation number。当 `_controllers` dictionary 超过 2 个条目时，自动找出 generation 最旧的非活跃 controller，透过 KVC（`[server valueForKeyPath:@"_private._controllers"] removeObjectForKey:oldKey]`）将其移除，使其在 MRC 下正常释放。
+**b) 以 KVC 修剪孤儿控制器。** 每个控制器在 init 时取得一个单调递增的世代号。每当有一个控制器被创建、并完成自身登记之后，就以 KVC 移除最旧的闲置控制器（世代号最小者，排除当前控制器与新建的这一个）：`[server valueForKeyPath:@"_private._controllers"] removeObjectForKey:oldKey]`。这让孤儿控制器在 MRC 下被正常析构。
 
-**c) 极性双缓冲 Session 池。** 以 controller generation number 的奇偶性（`generation % 2`）将所有 controller 映射至两枚 static `InputSession` singleton：偶数→session A，奇数→session B。每次 CpLk toggle 带来的新 controller 自动对接至**另一个** session；上一个 session 保留不释放，等待下一个同极性 controller 接手。此举完全消除了 InputSession 的动态分配、LRU 淘汰逻辑，以及缓存过期的风险。
+**c) 以控制器地址为键的小型会话池。** 唯音最初以世代奇偶路由会话（偶→会话 A、奇→会话 B，即本文旧版所述的「双缓冲」）。世代单调递增，所以奇偶看起来很稳定——而那正是陷阱：两个世代同奇偶的控制器会共用同一份会话。第一个退役时，该会话的客体绑定被清空；第二个仍继续通过一份不再认得自己客体的会话派发，于是每一个按键都在送达输入法之前就被丢掉。现行设计改以控制器自身的地址为键，会话池最多四份，只有在生命周期追踪器判定控制器已死时才回收该槽，且绝不做「最近最少使用」式的淘汰。
 
-**d) 延迟释放与 XPC 清理。** controller 在 `deactivateServer:` 后不会立即释放，而是排程 3 秒后执行清理：释放所有 blocks、调用 client wrapper 的 private `+terminateForClient*` class method（依序尝试 `_IPMDServerClientWrapperModern` → `_IPMDServerClientWrapperLegacy` → `IPMDServerClientWrapper` 以向前兼容 macOS 27）、清除 controller↔session 对照表。若 3 秒内 controller 被重新启用（`activateServer:`），则取消排程、恢复正常服务。这确保了 CpLk 快速切换时不会出现「旧 controller 已死、新 controller 尚未就绪」的真空期。
+**d) 延迟拆除，并清理 XPC。** `deactivateServer:` 之后不立即析构控制器，而是启动一个三秒计时器。计时器触发时，控制器会：释放所有 block、对适当的客体包装类别调用私有的 `+terminateForClient*` 类方法（依 `_IPMDServerClientWrapperModern` → `_IPMDServerClientWrapperLegacy` → `IPMDServerClientWrapper` 的顺序回退，以兼容 macOS 27），并清除控制器↔会话的对应。若控制器在三秒内被重新启用（`activateServer:`），计时器即取消、正常服务。这避免了快速 CapsLock 切换时「旧控制器已死、新控制器还没准备好」的空窗。
 
-**e) Dangling pointer 防护。** `IMKControllerLifetimeTracker` singleton 在每次以 `takeUnretainedValue()` 解读 raw 位址前复查 controller 是否仍存活。`unregisterSessionAddr` 仅在 session 仍归属于该 controller 时才清空 `inputControllerAssignedAddr`（防止已 reassign 给新 controller 的 session 被旧 controller 的延迟 dealloc 误清）。`reassign` 同步清除旧 controller 在 `sessionAddrByControllerAddr` 中的残留 mapping。
+> 延迟拆除买到的是「重用窗口」；它**不**代表控制器已经死了。控制器外壳可能还留在 `_controllers` 里，直到下一次修剪为止——所以千万不要把「计时器已触发」当成存活判据。
 
-**f) IME 菜单注入。** `IMEMenuSputnik` 利用 ObjC Runtime 的 `class_addMethod` + `imp_implementationWithBlock` 将 Swift closure 直接注册为 `IMKInputSessionController` 的 method IMP，无需 `@objc` Selector 暴露即可动态构建输入法菜单。菜单注入两项即时监测数据：(1) `IMKControllerLifetimeTracker` 所追踪的 controller 存活数量；(2) 以 `task_vm_info.internal` 取得的 anonymous private memory 用量。菜单开启前会先调用 `purgeMallocZones()` 强制回收 allocator cache，以确保内存读数真实。
+**e) 逐事件认领客体。** 每一个送达的事件，在派发之前，会话先把自身重新绑定到「送来这个事件之控制器」的地址。若值未变则跳过写入，因此成本是每按一键一次比较。就是这一行让整个设计能自愈：无论系统把事件路由给哪个副本，会话的客体永远是当下正在送事件的那一位。`IMKControllerLifetimeTracker` 仍然守着每一次对原始地址的 `takeUnretainedValue()`。
 
-### 5.3 架构总结
+**f) 以 ObjC runtime 注入输入法菜单。** 输入法菜单由 `IMEMenuSputnik` 动态组建：以 `class_addMethod` ＋ `imp_implementationWithBlock` 把 Swift 闭包直接注册为 `IMKInputSessionController` 上的方法 IMP，无需暴露 `@objc` selector。菜单会注入两项即时指标：(1) `IMKControllerLifetimeTracker` 追踪的存活控制器数；(2) 由 `task_vm_info.internal` 取得的匿名私有运存用量。每次菜单打开前会调用 `purgeMallocZones()` 清空分配器缓存，使运存读数反映实际用量。
 
-ARC 从 IMK dispatch 路径中完全移除，CapsLock 卡顿彻底消除。两枚 singleton session 取代 LRU 缓存，极性路由消除了缓存复杂度。KVC prune 路径补偿了 IMKServer 无法自行清理孤弃 controller 的缺陷。延迟释放确保 XPC 连线被正确终止而非泄漏。
+### 5.3 架构摘要
 
-以下为 controller 侧架构的最小化示意：
+整体效果是：ARC 彻底退出 IMK 派发路径，CapsLock 卡顿消失；以地址为键的小型会话池取代了极性配对，也就消除了别名共享（aliasing）的隐患；KVC 修剪补上了 IMKServer 无力自行清理孤儿的缺口；逐事件认领让「过期的客体绑定」不可能存在；延迟拆除则确保 XPC 连接被正常终止，而不是泄漏。
+
+以下是控制器侧架构的最小示意：
 
 ```swift
-// IMKInputSessionController（MRC 编译的 .m 文件）：
-// - Class-level static blocks 透过 raw address 向 Swift 分派。
-// - +IMKSwift_configureWithActivatingServer: 等在启动时一次性设定。
+// IMKInputSessionController（以 MRC 编译的 .m 文件）：
+// - 类别层级的 static block 以原始地址把调用派发给 Swift。
+// - +IMKSwift_configureWithActivatingServer: 等在启动时设置一次。
 
-// Swift 端——极性路由：
-public final class InputSession {
-  /// 两枚预先配置的 singleton session。
-  fileprivate static let sessionEven = InputSession(preallocated: ())
-  fileprivate static let sessionOdd  = InputSession(preallocated: ())
+// Swift 端：以地址为键的会话池
+@MainActor
+final class SessionPool {
+  static let shared = SessionPool(capacity: 4)
+  private var slots: [UInt: InputSession] = [:]
 
-  /// 依 controller 的 generation parity 解析对应 session。
-  static func session(for ctlAddr: UInt) -> InputSession? {
-    let parity = IMKControllerLifetimeTracker.shared().generationForAddress(ctlAddr) % 2
-    return parity == 0 ? sessionEven : sessionOdd
-  }
+  func session(for ctlAddr: UInt) -> InputSession { /* 创建或重用此地址的槽位 */ }
+  func reap(using tracker: IMKControllerLifetimeTracker) { /* 收掉控制器已死的槽位 */ }
 }
 
-// SessionControllerSputnik.callCoreAtLeastOnce:
-// 1. 由 controller generation 决定 parity。
-// 2. 路由至 sessionEven 或 sessionOdd。
-// 3. 重新指派 client provider（无缓存查询、无淘汰逻辑）。
+// SessionControllerSputnik 的事件区块：
+// 1. 为送来事件的控制器地址取得（或创建）会话。
+// 2. adoptClientAddr(ctlAddr)——以送事件的人为准。
+// 3. 派发进该会话的核心。
 ```
 
-> **注意：** 极性池刻意不以 client 位址为键。它接受 CapsLock 切换会产生不同位址的新 proxy 这一现实，改以 controller generation parity——一个稳定、单调递增的计数器——作为路由键。两个 session 的上限是充分的，因为同时最多只有两个 controller 可能活跃（当前的一个与正在被 deactivate 的一个）。
+> **注：** 会话池以**控制器**地址为键，不是客体地址。控制器才是框架真正管理生命周期的对象；客体只是一个随时可能在其脚下被替换的代理。四个槽位足够，因为系统同时最多只会有一个现役控制器，外加一小截正在退役的尾巴。
+
+### 5.4 可观测性与 kill switch
+
+这些东西没法用断点调试。你能做的是给它装上观测点，并且让你每一项干涉都能被单独关掉。
+
+**日志词汇。** ObjC 层只吐一组固定的词汇：`ControllerInit:`、`Prune:`（`controllers=`、`current=`、`self=`、`evicted … remaining=`）、`ActivateServer:`（含 `clientTerminatedBefore=`）、`DeactivateServer:`、`DelayedDealloc:`（排定／跳过／执行）、`EventEntry:`（`addr`、`alive`、`gen`、`session=`，以及缓存下来的客体名称）、`guard fail:`（`hasHandler`、`hasClient`、`proxyNil`）。macOS 26 起走 `Logger(subsystem: "vChewing", category: "Log")`，更早的系统回退到 `NSLog`；另有调试模式旗标可整体关闭。
+
+**四个仅供诊断的开关**，见于「开发者道场」面板，亦可用原始 `UserDefaults` 键设置：
+
+| 开关 | 停用什么 |
+|---|---|
+| `configureServerControllerPruningDisabled(_:)` | KVC 修剪 |
+| `configureEvictedClientInvalidationDisabled(_:)` | 对被修剪控制器的客体条目作失效处理（只关掉淘汰行为中较激进的那一半） |
+| `configureClientWrapperTerminationDisabled(_:)` | 对包装对象调用 `+terminateForClient*`，但保留 dealloc 簿记 |
+| `configureControllerDelayedDeallocationDisabled(_:)` | 整个延迟拆除 |
+
+每一个 block 都是在「决策当下」求值、且从不缓存；唯音以四个 `_IMKSwift_disable…` 偏好设置喂给它们，所以运行中进程的开关状态可以即时改变，无需重编。
+
+十六种原始组合，九种可分辨的行为：延迟拆除一关，客体终止与客体失效这两个开关在同一序列里就不可达；而修剪一关，客体失效的开关也就无意义了。加这些开关的理由很单纯：让现场回报可以被二分，而不是只能猜。
+
+**三种故障签名**，这些词汇能帮你分辨：
+
+1. 失灵时段完全没有 `EventEntry:` ⇒ 事件从未送达；
+2. 有 `EventEntry:` 但 `alive=false`，或出现 `UnresolvableController:` ⇒ 地址弄丢了；
+3. 有 `EventEntry:` 且 `alive=true`，但 `session=` 指向另一个客体，或 `assigned=nil` ⇒ 事件送给了错的客体。
+
+**安装器。** 请在套件本体替换**之后**再抓取进程 PID，依序 `SIGTERM` → `SIGKILL`、轮询确认已空、再验证。不要 `killall` 了事，也不要在替换之前就杀（IMK 会从已注册的套件按需重启输入法，替换前杀只是让旧代码以新 PID 回来）。以 root 身份执行时，请以 `/usr/bin/stat -f%Su /dev/console` 把终止范围限制在当前控制台用户。
 
 ## 6. 将输入法所有程式内容写成 Swift Package Library
 

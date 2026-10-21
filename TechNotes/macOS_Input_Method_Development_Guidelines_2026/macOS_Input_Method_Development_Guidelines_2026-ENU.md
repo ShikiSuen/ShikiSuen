@@ -1,8 +1,8 @@
 # macOS Input Method Development Guidelines for 2026
 
-The Input Method Kit (IMK) framework emerged during the macOS 10.5 Leopard era—predating Objective-C ARC, XPC communication, and the Sandbox (all introduced in macOS 10.7). Naturally, it also came before Swift 5 and SwiftUI gained popularity. In other words, InputMethodKit is a legacy framework that has spanned two generations of technology paradigm shifts. Apple's original reference manual for macOS 10.5 Leopard, the *[Input Method Kit Framework Reference](https://leopard-adc.pepas.com/documentation/Cocoa/Reference/InputMethodKitFrameworkRef/InputMethodKitFrameworkRef.pdf)* (henceforth "IMKFR"), no longer meets the requirements imposed by these shifts—particularly those of Swift 6 Concurrency. Based on my experience developing the [vChewing input method (targeting macOS 10.09 Mavericks to the latest macOS 26)](https://vchewing.github.io/), I've compiled these guidelines for other engineers seeking to develop input methods for macOS.
+The Input Method Kit (IMK) framework emerged during the macOS 10.5 Leopard era—predating Objective-C ARC, XPC communication, and the Sandbox (all introduced in macOS 10.7). Naturally, it also came before Swift 5 and SwiftUI gained popularity. In other words, InputMethodKit is a legacy framework that has spanned two generations of technology paradigm shifts. Apple's original reference manual for macOS 10.5 Leopard, the *[Input Method Kit Framework Reference](https://leopard-adc.pepas.com/documentation/Cocoa/Reference/InputMethodKitFrameworkRef/InputMethodKitFrameworkRef.pdf)* (henceforth "IMKFR"), no longer meets the requirements imposed by these shifts—particularly those of Swift 6 Concurrency. Based on my experience developing the [vChewing input method (targeting macOS 10.09 Mavericks to the latest macOS 27)](https://vchewing.github.io/), I've compiled these guidelines for other engineers seeking to develop input methods for macOS.
 
-> I also developed the [IMKSwift](https://github.com/vChewing/IMKSwift) package to make it easier for Swift developers to write IMK input methods. IMKSwift provides the IMKInputSessionController base type, which replaces the ObjC header definitions of IMKInputController with expressions more friendly to Modern Swift Concurrency. Using this package benefits the devs that some of the verbose details in the following sections may not need to be strictly adhered to.
+> I also developed the [IMKSwift](https://github.com/vChewing/IMKSwift) package to make it easier for Swift developers to write IMK input methods. IMKSwift provides the IMKInputSessionController base type, which replaces the ObjC header definitions of IMKInputController with expressions more friendly to Modern Swift Concurrency. The package also ships the MRC private-surface layer described in §5, so that section can be read as a reference implementation rather than a to-do list.
 
 ## 1. NSConnection Naming
 
@@ -124,7 +124,7 @@ Therefore, all Client methods *except* `client()?.setMarkedText` & `client()?.in
 
 > Note: `client()?` is a MainActor-confined object. You can async-run, but the lambda expression calling Client methods must run on the MainActor.
 
-## 5. IMKInputController Must Be MRC-Managed and Parity-Routed
+## 5. IMKInputController Must Be MRC-Managed, and the Client Binding Must Be Re-Established per Event
 
 ### 5.1 The IMKServer Controller-Leak Flaw (Reverse‑Engineered)
 
@@ -142,25 +142,27 @@ Through extensive reverse engineering of InputMethodKit across macOS 10.9 Maveri
 
 6. Under ARC, the retain/release churn from frequent CapsLock switching can cause perceptible stutter. Disabling ARC (`-fno-objc-arc`) eliminates the stutter completely, but then you must handle orphaned controller cleanup and residual XPC connection teardown manually.
 
-### 5.2 The Fix: MRC + KVC Prune + Parity-Based Session Pool
+7. **The orphan is not merely leaked — it keeps the client binding it had when it was deactivated.** Nothing in the framework will ever update it again, because nothing in the framework still believes the controller is in service. Any keystroke the system routes to such a controller is then answered with a retired client's identity.
 
-Given these findings, the vChewing project adopted the following architecture (codename "Phase 115"):
+### 5.2 The Fix: MRC + KVC Prune + Address-Keyed Sessions + Per-Event Adoption
 
 **a) Full MRC for the IMK interaction layer.** The `IMKInputSessionController` target is compiled with `-fno-objc-arc`. All controller alloc/dealloc/retain/release happens in the ObjC MRC layer. The Swift side interacts with controllers only through raw memory addresses (`uintptr_t`), never performing Swift ARC operations on controller instances.
 
-**b) KVC-based orphaned controller pruning.** A monotonically increasing generation number is assigned to each controller at init. When the `_controllers` dictionary exceeds 2 entries, the oldest inactive controller (lowest generation) is removed via KVC: `[server valueForKeyPath:@"_private._controllers"] removeObjectForKey:oldKey]`. This prunes orphaned controllers in MRC so they are properly deallocated.
+**b) KVC-based orphaned controller pruning.** A monotonically increasing generation number is assigned to each controller at init. On every controller creation — after the new controller has registered itself — the oldest inactive controller (lowest generation, excluding the current controller and the new one) is removed via KVC: `[server valueForKeyPath:@"_private._controllers"] removeObjectForKey:oldKey]`. This prunes orphaned controllers in MRC so they are properly deallocated.
 
-**c) Parity-based double-buffered session pool.** Instead of an LRU cache of arbitrary capacity, the controller's generation number parity (`generation % 2`) maps to one of exactly two static `InputSession` singletons: even → session A, odd → session B. Each CapsLock toggle brings a new controller that is routed to the *other* session; the previous session is retained, waiting for the next same-parity controller to take over. This eliminates dynamic allocation, LRU eviction logic, and any risk of session cache staleness.
+**c) A small session pool keyed by controller address.** vChewing first routed sessions by generation parity (even → session A, odd → session B — the "double buffer" described in earlier revisions of this document). Generations are monotonic, so parity looks stable, and that was the trap: two controllers whose generations share a parity share one session. When the first retires, the session's client binding is cleared; the second keeps dispatching through a session that no longer knows its client, and every key is dropped before it reaches the IME. The current design keys sessions by the controller's own address in a pool of at most four, reaps a slot only when the lifetime tracker says the controller is gone, and never evicts by recency.
 
 **d) Delayed dealloc with XPC cleanup.** After `deactivateServer:`, the controller is not immediately deallocated. Instead, a 3-second timer is started. When it fires, the controller: releases all blocks, invokes the private `+terminateForClient*` class methods on the appropriate client wrapper class (falling back through `_IPMDServerClientWrapperModern` → `_IPMDServerClientWrapperLegacy` → `IPMDServerClientWrapper` for forward compatibility with macOS 27), and clears the controller↔session mapping. If the controller is reactivated within 3 seconds (`activateServer:`), the timer is cancelled and normal service resumes. This prevents a "dead controller, not-yet-ready new controller" gap during rapid CapsLock toggling.
 
-**e) Dangling pointer protection.** An `IMKControllerLifetimeTracker` singleton verifies controller liveness before every `takeUnretainedValue()` call on a raw address. The `unregisterSessionAddr` path only clears `inputControllerAssignedAddr` if the session still belongs to that controller — preventing a reassigned session from being wiped by a stale controller's delayed dealloc. The `reassign` path simultaneously cleans up the old controller's stale mapping in `sessionAddrByControllerAddr`.
+> Delayed dealloc buys the reuse window; it does **not** mean the controller has died. The shell may remain in `_controllers` until the next prune, so never use "the timer fired" as a liveness test.
+
+**e) Per-event client adoption.** On every delivered event, before dispatch, the session rebinds itself to the sending controller's address. The write is skipped when the value is unchanged, so it costs one comparison per keystroke. This single line is what makes the design self-healing: whichever copy the system routes to, the session's client is whoever is sending *now*. `IMKControllerLifetimeTracker` still guards every `takeUnretainedValue()` on a raw address.
 
 **f) IME menu injection via ObjC runtime.** The IME menu is dynamically built by `IMEMenuSputnik` which uses `class_addMethod` + `imp_implementationWithBlock` to register Swift closures directly as method IMPs on `IMKInputSessionController`. No `@objc` selector exposure is needed. The menu injects two live metrics: (1) the count of alive controller instances tracked by `IMKControllerLifetimeTracker`, and (2) anonymous private memory usage obtained from `task_vm_info.internal`. Before each menu open, `purgeMallocZones()` is called to flush allocator caches so the memory reading reflects actual usage.
 
 ### 5.3 Architectural Summary
 
-The net effect is that ARC is fully removed from the IMK dispatch path, eliminating CapsLock stutter. The two-singleton session pool eliminates LRU cache complexity. The KVC prune path compensates for IMKServer's inability to clean up orphaned controllers on its own. The delayed dealloc ensures XPC connections are properly terminated rather than leaked.
+The net effect is that ARC is fully removed from the IMK dispatch path, eliminating CapsLock stutter. A small address-keyed session pool replaces the parity pair and eliminates the aliasing hazard. The KVC prune path compensates for IMKServer's inability to clean up orphaned controllers on its own. Per-event adoption makes a stale binding impossible. The delayed dealloc ensures XPC connections are properly terminated rather than leaked.
 
 Below is a minimal sketch of the controller-side architecture:
 
@@ -169,26 +171,50 @@ Below is a minimal sketch of the controller-side architecture:
 // - Class-level static blocks dispatch to Swift via raw addresses.
 // - +IMKSwift_configureWithActivatingServer: etc. set once at startup.
 
-// Swift side — parity-based session routing:
-public final class InputSession {
-  /// The two preallocated singleton sessions.
-  fileprivate static let sessionEven = InputSession(preallocated: ())
-  fileprivate static let sessionOdd  = InputSession(preallocated: ())
+// Swift side — address-keyed session pool:
+@MainActor
+final class SessionPool {
+  static let shared = SessionPool(capacity: 4)
+  private var slots: [UInt: InputSession] = [:]
 
-  /// Resolve the session for a given controller's generation parity.
-  static func session(for ctlAddr: UInt) -> InputSession? {
-    let parity = IMKControllerLifetimeTracker.shared().generationForAddress( ctlAddr) % 2
-    return parity == 0 ? sessionEven : sessionOdd
-  }
+  func session(for ctlAddr: UInt) -> InputSession { /* create or reuse this address's slot */ }
+  func reap(using tracker: IMKControllerLifetimeTracker) { /* drop slots whose controller is gone */ }
 }
 
-// SessionControllerSputnik.callCoreAtLeastOnce:
-// 1. Determine parity from controller generation.
-// 2. Route to sessionEven or sessionOdd.
-// 3. Reassign client provider (no cache lookup, no eviction).
+// SessionControllerSputnik event block:
+// 1. Resolve (or create) the session for the sending controller's address.
+// 2. adoptClientAddr(ctlAddr) — the sender is the authority.
+// 3. Dispatch into the session's core.
 ```
 
-> **Note:** The parity-based pool is intentionally *not* keyed by client address. It embraces the reality that CapsLock toggles create new proxy objects with different addresses, and instead uses controller generation parity — a stable, monotonically increasing counter — as the routing key. The two-session limit is sufficient because at most two controllers can be active simultaneously (the current one and the one being deactivated).
+> **Note:** the pool is keyed by *controller* address, not client address. The controller is the object whose lifetime the framework actually manages; the client is a proxy that can be replaced beneath it at any time. Four slots suffice because the system keeps at most one active controller plus a short tail of retiring ones.
+
+### 5.4 Observability and Kill Switches
+
+You cannot breakpoint any of this. What you can do is instrument it, and make every intervention individually switchable.
+
+**Log vocabulary.** The ObjC layer emits a fixed set of tokens: `ControllerInit:`, `Prune:` (`controllers=`, `current=`, `self=`, `evicted … remaining=`), `ActivateServer:` (with `clientTerminatedBefore=`), `DeactivateServer:`, `DelayedDealloc:` (scheduled / skipped / fired), `EventEntry:` (`addr`, `alive`, `gen`, `session=`, plus the cached client name), and `guard fail:` (`hasHandler`, `hasClient`, `proxyNil`). On macOS 26 and later they go through `Logger(subsystem: "vChewing", category: "Log")`; earlier systems fall back to `NSLog`. A debug-mode flag gates them.
+
+**Four diagnostics-only switches**, exposed in the DevZone pane and as raw `UserDefaults` keys:
+
+| Switch | Disables |
+|---|---|
+| `configureServerControllerPruningDisabled(_:)` | the KVC prune |
+| `configureEvictedClientInvalidationDisabled(_:)` | invalidating the evicted controller's client entry (only the aggressive half of the eviction) |
+| `configureClientWrapperTerminationDisabled(_:)` | `+terminateForClient*` on the wrapper, keeping the dealloc bookkeeping |
+| `configureControllerDelayedDeallocationDisabled(_:)` | the whole deferred teardown |
+
+Each block is evaluated at the decision point and never cached; vChewing feeds them from four `_IMKSwift_disable…` preferences, so the switch states of a running process can be changed without a rebuild.
+
+Sixteen raw combinations, nine distinguishable behaviours: the delayed-dealloc switch already makes the wrapper-termination and eviction switches unreachable in the same sequence, and the prune switch makes the eviction switch moot. They exist so that a report from the field can be turned into a bisection instead of a guess.
+
+**Three failure signatures** the tokens let you tell apart:
+
+1. no `EventEntry:` for the dead window ⇒ the event was never delivered;
+2. `EventEntry:` with `alive=false`, or `UnresolvableController:` ⇒ the address was lost;
+3. `EventEntry:` with `alive=true` but `session=` naming another client, or `assigned=nil` ⇒ the event went to the wrong client.
+
+**Installers.** Capture the running PIDs *after* the payload swap, escalate `SIGTERM` → `SIGKILL`, poll for vacancy, and verify. Never `killall` and hope; never kill before the swap (IMK relaunches the IME from the registered bundle, so a pre-swap kill only restarts the old code under a new PID). When running as root, scope the kill to the console user via `/usr/bin/stat -f%Su /dev/console`.
 
 ## 6. Write All Input Method Code as Swift Package Libraries
 
